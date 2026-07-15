@@ -68,9 +68,10 @@ ardy_choreograph(steps=[
 ])
 ```
 
-Each call returns the path to an ARDY-native `.npz`, loadable in ARDY's own
-viewer (`scripts/visualize.py`) or renderable with your own skin (e.g. the
-N64-Sophia flat-color rig).
+Each call returns the path to an ARDY-native `.npz` (loadable in ARDY's own
+viewer `scripts/visualize.py`) **plus** a `stream_id` you can `play` on the
+WebSocket to push the motion live into a running viser viewer.  See
+[Live viewer](#live-viewer) below.
 
 ## MCP tools
 
@@ -81,11 +82,60 @@ N64-Sophia flat-color rig).
 | `ardy_list_models` | List motion models (core vs G1). |
 | `ardy_status` | Service health: device, loaded models, encoder link. |
 
+## Live viewer
+
+When you generate or choreograph motion, the service **also** buffers it in memory
+and streams it at the motion's native frame rate to every connected WebSocket
+viewer in real-time.  The character moves in the browser window as the frames
+arrive — no file reloads, no manual playback.
+
+### Start the viewer
+
+```bash
+# On the ARDY host (or any machine that can reach it):
+cd ~/ardy && source venv/bin/activate
+pip install -r /path/to/ardy-director/requirements-viewer.txt
+python /path/to/ardy-director/director_service/viewer.py
+```
+
+Open **http://localhost:9601** in a browser — you'll see a 27-joint humanoid
+skeleton.  Every `/generate` and `/choreograph` call immediately pushes the
+motion into the view.
+
+The viewer is a standalone [viser](https://viser.ai) server; you can run
+multiple instances (`--port 9602`) to watch from different angles, or adjust
+the skeleton topology with a custom JSON file:
+
+```bash
+python director_service/viewer.py --skeleton my_skeleton.json
+```
+
+### WebSocket protocol
+
+Viewers connect to `ws://<host>:9600/ws`.  The service broadcasts these messages:
+
+| Type | Direction | Payload |
+|------|-----------|---------|
+| `start` | service → viewer | `{id, prompt, fps, total_frames, num_joints}` |
+| `frame` | service → viewer | `{id, frame, total, posed_joints: [[x,y,z],...], root_position, local_rot_mats}` |
+| `done` | service → viewer | `{id}` |
+
+Viewers can send commands:
+
+```json
+{"command": "list"}                              // list buffered clips
+{"command": "play", "id": "<stream_id>", "loop": 2}  // replay a clip
+{"command": "generate", "prompt": "wave", "duration": 3}  // generate + auto-stream
+```
+
+The `stream_id` returned by `/generate` and `/choreograph` can be passed to
+`play` to replay a clip any time.
+
 ## Roadmap
 
 - **v0.1 (now):** generate + position-chained choreography, model caching, encoder reuse.
+- **Live viewer injection (now):** motion streams in real-time to a viser viewer over WebSocket.
 - **Streaming choreography:** velocity-smooth seams via ARDY's `autoregressive_step` (change the prompt mid-stream instead of stitching segments).
-- **Live viewer injection:** push directed motion straight into the running viser demo.
 - **Scene generation:** the larger goal — compose full visual scenes (camera, staging, multiple characters, background) around ARDY's demo, with the LLM as director.
 
 ## License

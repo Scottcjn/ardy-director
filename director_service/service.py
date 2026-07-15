@@ -16,10 +16,14 @@ Endpoints:
   GET  /models                      -> known model nicknames
   POST /generate    {prompt,...}    -> one clip from one prompt
   POST /choreograph {steps:[...]}   -> one clip stitched from a prompt sequence
+  WS   /ws                         -> WebSocket: receive play commands, stream frames
 
-Motion is written as ARDY-native .npz under OUTPUT_DIR and the path is returned,
-so ARDY's own viewer (scripts/visualize.py) can load it.
+Motion is written as ARDY-native .npz under OUTPUT_DIR (for backward compat) AND
+buffered for live streaming to connected WebSocket viewers.  Start any number of
+viser-based viewers (director_service/viewer.py), connect, and they receive each
+generated clip in real-time at the motion's native frame rate.
 """
+import asyncio
 import os
 import threading
 import time
@@ -27,7 +31,7 @@ import uuid
 
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
 from ardy.model.load_model import load_model, load_text_encoder
@@ -112,6 +116,102 @@ def _save_npz(motion, fps, text, tag):
     return path
 
 
+# --- WebSocket connection manager + motion buffer ----------------------------
+class ConnectionManager:
+    def __init__(self):
+        self._connections: list[WebSocket] = []
+        self._lock = threading.Lock()
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        with self._lock:
+            self._connections.append(ws)
+
+    def disconnect(self, ws: WebSocket):
+        with self._lock:
+            if ws in self._connections:
+                self._connections.remove(ws)
+
+    async def broadcast(self, message: dict):
+        dead = []
+        with self._lock:
+            conns = list(self._connections)
+        for ws in conns:
+            try:
+                await ws.send_json(message)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(ws)
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return len(self._connections)
+
+
+_manager = ConnectionManager()
+
+# Motion buffer: id -> {motion, fps, prompt, label}
+_motion_buf: dict[str, dict] = {}
+_buf_lock = threading.Lock()
+
+
+def _buffer_motion(motion: dict, fps: int, prompt: str, label: str = "") -> str:
+    cid = uuid.uuid4().hex[:12]
+    with _buf_lock:
+        _motion_buf[cid] = {"motion": motion, "fps": fps, "prompt": prompt, "label": label or prompt}
+    return cid
+
+
+async def _stream_motion(cid: str, loop_count: int = 1):
+    """Broadcast a buffered motion to all connected viewers at its native FPS."""
+    with _buf_lock:
+        entry = _motion_buf.get(cid)
+    if entry is None:
+        return
+
+    motion = entry["motion"]
+    fps = entry["fps"]
+    posed = motion.get("posed_joints", None)
+    root_pos = motion.get("root_positions", None)
+    rots = motion.get("local_rot_mats", None)
+    if posed is None:
+        return
+
+    num_frames = posed.shape[0]
+    num_joints = posed.shape[1]
+    delay = 1.0 / fps
+
+    for loop in range(loop_count):
+        await _manager.broadcast({
+            "type": "start",
+            "id": cid,
+            "prompt": entry["prompt"],
+            "label": entry["label"],
+            "fps": fps,
+            "total_frames": num_frames,
+            "num_joints": num_joints,
+            "loop": loop,
+            "total_loops": loop_count,
+        })
+        for i in range(num_frames):
+            frame = {
+                "type": "frame",
+                "id": cid,
+                "frame": i,
+                "total": num_frames,
+                "posed_joints": posed[i].tolist(),
+                "root_position": root_pos[i].tolist() if root_pos is not None else None,
+            }
+            if rots is not None:
+                frame["local_rot_mats"] = rots[i].tolist()
+            await _manager.broadcast(frame)
+            await asyncio.sleep(delay)
+
+    await _manager.broadcast({"type": "done", "id": cid})
+
+
 # --- request models ----------------------------------------------------------
 class GenerateReq(BaseModel):
     prompt: str
@@ -156,7 +256,7 @@ def models():
 
 
 @app.post("/generate")
-def generate(req: GenerateReq):
+async def generate(req: GenerateReq):
     try:
         resolved, model = _get_model(req.model)
         fps = model.motion_rep.fps
@@ -168,14 +268,18 @@ def generate(req: GenerateReq):
                                 req.cfg_weight, req.seed, np.deg2rad(req.heading_deg), hist)
         tag = f"gen_{int(time.time())}_{uuid.uuid4().hex[:6]}"
         path = _save_npz(motion, fps, req.prompt, tag)
+        cid = _buffer_motion(motion, fps, req.prompt)
+        if _manager.count > 0:
+            asyncio.create_task(_stream_motion(cid))
         return {"ok": True, "model": resolved, "fps": int(fps), "frames": num_frames,
-                "duration_s": req.duration, "npz": path, "prompt": req.prompt}
+                "duration_s": req.duration, "npz": path, "prompt": req.prompt,
+                "stream_id": cid}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
 @app.post("/choreograph")
-def choreograph(req: ChoreographReq):
+async def choreograph(req: ChoreographReq):
     """Generate each step, then chain segments by carrying the root XZ offset and
     heading so the character continues from where the previous step ended.
 
@@ -217,11 +321,80 @@ def choreograph(req: ChoreographReq):
         motion = {k: np.concatenate(v, axis=0) for k, v in acc.items() if v}
         tag = f"choreo_{int(time.time())}_{uuid.uuid4().hex[:6]}"
         path = _save_npz(motion, fps, " | ".join(labels), tag)
+        cid = _buffer_motion(motion, fps, " | ".join(labels), labels[0] if labels else "")
+        if _manager.count > 0:
+            asyncio.create_task(_stream_motion(cid))
         total = int(sum(int(s.duration * fps) for s in req.steps))
         return {"ok": True, "model": resolved, "fps": int(fps), "frames": total,
-                "segments": len(req.steps), "npz": path, "sequence": labels}
+                "segments": len(req.steps), "npz": path, "sequence": labels,
+                "stream_id": cid}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+
+# --- WebSocket endpoint ------------------------------------------------------
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    await _manager.connect(ws)
+    try:
+        while True:
+            data = await ws.receive_json()
+            cmd = data.get("command")
+
+            if cmd == "play":
+                cid = data.get("id", "")
+                loops = data.get("loop", 1)
+                with _buf_lock:
+                    exists = cid in _motion_buf
+                if exists:
+                    asyncio.create_task(_stream_motion(cid, loops))
+                else:
+                    await ws.send_json({"type": "error", "message": f"clip '{cid}' not found"})
+
+            elif cmd == "stop":
+                pass
+
+            elif cmd == "list":
+                with _buf_lock:
+                    clips = [{"id": k, "label": v["label"], "prompt": v["prompt"],
+                              "fps": v["fps"],
+                              "frames": int(v["motion"]["posed_joints"].shape[0])}
+                             for k, v in _motion_buf.items()]
+                await ws.send_json({"type": "clip_list", "clips": clips})
+
+            elif cmd == "generate":
+                prompt = data.get("prompt", "")
+                duration = data.get("duration", 4.0)
+                model_name = data.get("model", "core")
+                loops = data.get("loop", 1)
+                if not prompt:
+                    await ws.send_json({"type": "error", "message": "prompt is required"})
+                    continue
+                try:
+                    resolved, model = _get_model(model_name)
+                    fps = model.motion_rep.fps
+                    nf = int(duration * fps)
+                    steps = data.get("diffusion_steps") or int(model.diffusion.num_base_steps)
+                    patch = model.num_frames_per_token
+                    hist = (int(round(10 * fps)) // patch) * patch
+                    motion = _generate_clip(model, resolved, prompt, nf, steps,
+                                            data.get("cfg_weight", 4.0),
+                                            data.get("seed"), np.deg2rad(data.get("heading_deg", 0.0)),
+                                            hist)
+                    cid = _buffer_motion(motion, fps, prompt)
+                    tag = f"gen_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+                    _save_npz(motion, fps, prompt, tag)
+                    await ws.send_json({
+                        "type": "generated", "id": cid, "fps": int(fps),
+                        "frames": nf, "duration_s": duration, "npz": tag + ".npz",
+                    })
+                    if loops > 0:
+                        asyncio.create_task(_stream_motion(cid, loops))
+                except Exception as e:
+                    await ws.send_json({"type": "error", "message": f"{type(e).__name__}: {e}"})
+
+    except WebSocketDisconnect:
+        _manager.disconnect(ws)
 
 
 if __name__ == "__main__":
