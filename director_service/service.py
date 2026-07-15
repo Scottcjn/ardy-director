@@ -195,13 +195,13 @@ def choreograph(req: ChoreographReq):
                     "root_positions", "foot_contacts", "global_root_heading"]
         acc = {k: [] for k in seg_keys}
         root_offset = np.zeros(3, dtype=np.float32)
-        heading_deg = 0.0
+        heading_rad = 0.0
         labels = []
         for i, st in enumerate(req.steps):
             nf = int(st.duration * fps)
             seed_i = None if req.seed is None else req.seed + i
             m = _generate_clip(model, resolved, st.prompt, nf, steps, req.cfg_weight,
-                               seed_i, np.deg2rad(heading_deg), hist)
+                               seed_i, heading_rad, hist)
             # carry root XZ so the next segment starts where this one ended
             # (arrays are squeezed to (frames, ...); index the last XYZ axis, not frames)
             rp = m["root_positions"].copy()          # (frames, 3)
@@ -209,6 +209,11 @@ def choreograph(req: ChoreographReq):
             m["root_positions"] = rp
             m["posed_joints"][..., [0, 2]] += root_offset[[0, 2]]  # (frames, joints, 3)
             root_offset = rp[-1].copy()
+            # ...and carry the facing too, else a step that turns is undone at the
+            # seam. global_root_heading is [cos(theta), sin(theta)] per frame.
+            gh = m.get("global_root_heading")
+            if gh is not None and len(gh):
+                heading_rad = float(np.arctan2(gh[-1][1], gh[-1][0]))
             for k in seg_keys:
                 if k in m:
                     acc[k].append(m[k])
