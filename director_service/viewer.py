@@ -4,15 +4,12 @@
 """Real-time viser viewer for ARDY Director.
 
 Receives motion frames over WebSocket from the director_service and renders
-them as a 27-joint humanoid skeleton in a viser 3D scene.  Updates in
-real-time at the motion's native frame rate, so the character appears to
-move as the model generates.
+them as a 27-joint humanoid skeleton in a viser 3D scene.  Also receives
+camera and staging state so the view can follow the character or orbit,
+and waypoints are drawn as scene markers.
 
 Usage:
-    # On the ARDY host (or any machine that can reach the director):
     python director_service/viewer.py
-
-    # With custom addresses:
     python director_service/viewer.py --director ws://192.168.0.136:9600 --port 9602
 
 Open http://localhost:<port> in a browser to see the live view.
@@ -23,6 +20,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import sys
 
 import numpy as np
@@ -33,46 +31,23 @@ logger = logging.getLogger("viewer")
 # ---------------------------------------------------------------------------
 # Skeleton definition
 # ---------------------------------------------------------------------------
-# ARDY's core model uses a 27-joint skeleton (approximate topology below).
-# If your ARDY build uses a different joint order, load a custom skeleton
-# via --skeleton <file.json> containing {"joint_names":[...], "bones":[[i,j],...]}.
 
 DEFAULT_JOINT_NAMES = [
-    "pelvis",        # 0
-    "left_hip",      # 1
-    "right_hip",     # 2
-    "spine_lower",   # 3
-    "left_knee",     # 4
-    "right_knee",    # 5
-    "spine_mid",     # 6
-    "left_ankle",    # 7
-    "right_ankle",   # 8
-    "spine_upper",   # 9
-    "left_foot",     # 10
-    "right_foot",    # 11
-    "neck",          # 12
-    "left_collar",   # 13
-    "right_collar",  # 14
-    "head",          # 15
-    "left_elbow",    # 16
-    "right_elbow",   # 17
-    "left_wrist",    # 18
-    "right_wrist",   # 19
-    "left_hand",     # 20
-    "right_hand",    # 21
-    "head_end",      # 22
-    "left_eye",      # 23
-    "right_eye",     # 24
-    "nose",          # 25
-    "jaw",           # 26
+    "pelvis", "left_hip", "right_hip", "spine_lower",
+    "left_knee", "right_knee", "spine_mid",
+    "left_ankle", "right_ankle", "spine_upper",
+    "left_foot", "right_foot",
+    "neck", "left_collar", "right_collar", "head",
+    "left_elbow", "right_elbow",
+    "left_wrist", "right_wrist",
+    "left_hand", "right_hand",
+    "head_end", "left_eye", "right_eye", "nose", "jaw",
 ]
 
 DEFAULT_BONES: list[tuple[int, int]] = [
     (0, 1), (0, 2), (0, 3),
-    (1, 4), (2, 5),
-    (3, 6),
-    (4, 7), (5, 8),
-    (6, 9),
+    (1, 4), (2, 5), (3, 6),
+    (4, 7), (5, 8), (6, 9),
     (7, 10), (8, 11),
     (9, 12), (9, 13), (9, 14),
     (12, 15),
@@ -82,45 +57,29 @@ DEFAULT_BONES: list[tuple[int, int]] = [
     (22, 15), (23, 15), (24, 15), (25, 15), (26, 15),
 ]
 
-# Color per joint (RGB normalized 0-1)
 JOINT_COLORS = np.array([
-    [0.27, 0.53, 1.00],  # pelvis
-    [1.00, 0.80, 0.27],  # left_hip
-    [0.27, 1.00, 0.80],  # right_hip
-    [0.27, 0.53, 1.00],  # spine_lower
-    [1.00, 0.80, 0.27],  # left_knee
-    [0.27, 1.00, 0.80],  # right_knee
-    [0.27, 0.53, 1.00],  # spine_mid
-    [1.00, 0.80, 0.27],  # left_ankle
-    [0.27, 1.00, 0.80],  # right_ankle
-    [0.27, 0.53, 1.00],  # spine_upper
-    [1.00, 0.80, 0.27],  # left_foot
-    [0.27, 1.00, 0.80],  # right_foot
-    [0.27, 0.53, 1.00],  # neck
-    [0.27, 1.00, 0.27],  # left_collar
-    [1.00, 0.27, 1.00],  # right_collar
-    [1.00, 0.40, 0.27],  # head
-    [0.27, 1.00, 0.27],  # left_elbow
-    [1.00, 0.27, 1.00],  # right_elbow
-    [0.27, 1.00, 0.27],  # left_wrist
-    [1.00, 0.27, 1.00],  # right_wrist
-    [0.27, 1.00, 0.27],  # left_hand
-    [1.00, 0.27, 1.00],  # right_hand
-    [1.00, 0.40, 0.27],  # head_end
-    [1.00, 0.60, 0.53],  # left_eye
-    [1.00, 0.60, 0.53],  # right_eye
-    [1.00, 0.60, 0.53],  # nose
-    [1.00, 0.60, 0.53],  # jaw
+    [0.27, 0.53, 1.00], [1.00, 0.80, 0.27], [0.27, 1.00, 0.80],
+    [0.27, 0.53, 1.00], [1.00, 0.80, 0.27], [0.27, 1.00, 0.80],
+    [0.27, 0.53, 1.00], [1.00, 0.80, 0.27], [0.27, 1.00, 0.80],
+    [0.27, 0.53, 1.00], [1.00, 0.80, 0.27], [0.27, 1.00, 0.80],
+    [0.27, 0.53, 1.00], [0.27, 1.00, 0.27], [1.00, 0.27, 1.00],
+    [1.00, 0.40, 0.27], [0.27, 1.00, 0.27], [1.00, 0.27, 1.00],
+    [0.27, 1.00, 0.27], [1.00, 0.27, 1.00],
+    [0.27, 1.00, 0.27], [1.00, 0.27, 1.00],
+    [1.00, 0.40, 0.27], [1.00, 0.60, 0.53], [1.00, 0.60, 0.53],
+    [1.00, 0.60, 0.53], [1.00, 0.60, 0.53],
 ])
 
 BONE_COLOR = (0.55, 0.55, 0.55)
+WAYPOINT_COLOR = (0.2, 0.8, 0.2)
+WAYPOINT_LINE_COLOR = (0.2, 0.6, 0.2)
 
 
 # ---------------------------------------------------------------------------
 # Viewer
 # ---------------------------------------------------------------------------
 class ArdyViewer:
-    """Viser-based viewer that streams motion frames from the director."""
+    """Viser-based viewer that streams motion frames + camera + staging."""
 
     def __init__(
         self,
@@ -141,11 +100,22 @@ class ArdyViewer:
             self.bones = list(DEFAULT_BONES)
 
         self.num_joints = len(self.joint_names)
+
+        # --- viser handles ---
         self._server = None
         self._joint_handles: dict[int, object] = {}
         self._bone_handles: dict[int, object] = {}
-        self._status_handle: object = None
-        self._ready = asyncio.Event()
+        self._waypoint_handles: list[object] = []
+        self._waypoint_line: object = None
+        self._status_label: object = None
+        self._camera_label: object = None
+        self._clients: list[object] = []
+
+        # --- state ---
+        self._camera: dict = {}
+        self._root_position: np.ndarray = np.zeros(3, dtype=np.float32)
+        self._waypoints: list[dict] = []
+        self._orbit_angle: float = 0.0
 
     # ---- viser scene -------------------------------------------------------
 
@@ -154,12 +124,22 @@ class ArdyViewer:
 
         self._server = viser.ViserServer(port=self.viser_port)
 
+        @self._server.on_client_connect
+        def _on_connect(client: viser.ClientHandle):
+            self._clients.append(client)
+            client.add_label("/status", text="Connected — waiting for motion...")
+            client.add_label("/camera_status", text="Camera: follow")
+            self._apply_camera_to_client(client)
+
+        @self._server.on_client_disconnect
+        def _on_disconnect(client: viser.ClientHandle):
+            if client in self._clients:
+                self._clients.remove(client)
+
         for i in range(self.num_joints):
             color = JOINT_COLORS[i] if i < len(JOINT_COLORS) else (0.5, 0.5, 0.5)
             sphere = self._server.add_sphere(
-                f"/joint/{i}",
-                radius=0.05,
-                color=tuple(color),
+                f"/joint/{i}", radius=0.05, color=tuple(color),
             )
             self._server.add_label(
                 f"/joint/{i}/label",
@@ -170,44 +150,161 @@ class ArdyViewer:
         for bi, (p, c) in enumerate(self.bones):
             mesh = self._server.add_mesh_simple(
                 f"/bone/{bi}",
-                vertices=self._bone_verts(p, c, np.zeros((self.num_joints, 3))),
+                vertices=self._bone_verts(np.zeros((self.num_joints, 3))),
                 faces=self._bone_faces(),
                 color=BONE_COLOR,
             )
             self._bone_handles[bi] = mesh
 
-        self._set_status("Connected — waiting for motion...")
+        # Waypoint group
+        self._server.add_frame("/waypoints")
+        self._server.add_frame("/waypoints/path")
+
+        self._status_label = "/status"
+        self._camera_label = "/camera_status"
+
         logger.info("Viser server ready on port %d", self.viser_port)
         logger.info("Open http://localhost:%d in a browser", self.viser_port)
 
     @staticmethod
-    def _bone_verts(pi: int, ci: int, pos: np.ndarray) -> list[tuple[float, float, float]]:
+    def _bone_verts(pos: np.ndarray) -> list[tuple[float, float, float]]:
         half = 0.015
         return [
-            (-half, -half, -half),
-            (half, -half, -half),
-            (half, half, -half),
-            (-half, half, -half),
-            (-half, -half, half),
-            (half, -half, half),
-            (half, half, half),
-            (-half, half, half),
+            (-half, -half, -half), (half, -half, -half),
+            (half, half, -half), (-half, half, -half),
+            (-half, -half, half), (half, -half, half),
+            (half, half, half), (-half, half, half),
         ]
 
     @staticmethod
     def _bone_faces() -> list[tuple[int, int, int]]:
         return [
-            (0, 1, 2), (0, 2, 3),
-            (4, 5, 6), (4, 6, 7),
-            (0, 1, 5), (0, 5, 4),
-            (2, 3, 7), (2, 7, 6),
-            (0, 3, 7), (0, 7, 4),
-            (1, 2, 6), (1, 6, 5),
+            (0, 1, 2), (0, 2, 3), (4, 5, 6), (4, 6, 7),
+            (0, 1, 5), (0, 5, 4), (2, 3, 7), (2, 7, 6),
+            (0, 3, 7), (0, 7, 4), (1, 2, 6), (1, 6, 5),
         ]
 
     def _set_status(self, text: str):
         if self._server is not None:
-            self._server.add_label("/status", text=text)
+            self._server.add_label(self._status_label, text=text)
+
+    # ---- camera ------------------------------------------------------------
+
+    def _apply_camera_to_client(self, client):
+        if not self._camera:
+            return
+        mode = self._camera.get("mode", "follow")
+        label = f"Camera: {mode}"
+        try:
+            client.add_label(self._camera_label, text=label)
+        except Exception:
+            pass
+
+    def _update_cameras(self):
+        """Push current camera state to all connected client cameras."""
+        if not self._camera or not self._server:
+            return
+        mode = self._camera.get("mode", "follow")
+        for client in self._clients:
+            try:
+                self._apply_camera_to_client(client)
+            except Exception:
+                pass
+
+    def _apply_follow_camera(self, root_pos: np.ndarray):
+        """Move camera to follow the character (per-frame)."""
+        if not self._camera:
+            return
+        mode = self._camera.get("mode", "follow")
+        dist = self._camera.get("distance", 3.0)
+        height = self._camera.get("height", 1.5)
+
+        rx, ry, rz = float(root_pos[0]), float(root_pos[1]), float(root_pos[2])
+        for client in self._clients:
+            try:
+                if mode == "follow":
+                    client.camera.position = (rx - dist, ry + height, rz + dist * 0.3)
+                    client.camera.look_at = (rx, ry + 0.8, rz)
+                elif mode == "over-the-shoulder":
+                    side = self._camera.get("side_offset", 0.3)
+                    fwd = self._camera.get("forward_offset", 0.5)
+                    sh = self._camera.get("shoulder_height", 1.6)
+                    client.camera.position = (rx + side, ry + sh, rz - fwd)
+                    client.camera.look_at = (rx, ry + 0.8, rz + 2.0)
+                elif mode == "fixed":
+                    pos = self._camera.get("position", [0.0, 2.0, 5.0])
+                    tgt = self._camera.get("target", [0.0, 1.0, 0.0])
+                    client.camera.position = tuple(pos)
+                    client.camera.look_at = tuple(tgt)
+                elif mode == "orbit":
+                    radius = self._camera.get("radius", 4.0)
+                    speed = self._camera.get("orbit_speed", 0.3)
+                    self._orbit_angle += speed * 0.016
+                    cx = rx + radius * math.cos(self._orbit_angle)
+                    cz = rz + radius * math.sin(self._orbit_angle)
+                    client.camera.position = (cx, ry + 1.5, cz)
+                    client.camera.look_at = (rx, ry + 0.8, rz)
+            except Exception:
+                pass
+
+    # ---- waypoints ---------------------------------------------------------
+
+    def _render_waypoints(self):
+        """Add/update waypoint markers and path line."""
+        if self._server is None:
+            return
+
+        # Remove old waypoint markers
+        for h in self._waypoint_handles:
+            try:
+                self._server.remove_frame(f"/waypoints/marker/{id(h)}")
+            except Exception:
+                pass
+        self._waypoint_handles.clear()
+
+        if not self._waypoints:
+            return
+
+        pts = np.array([
+            (wp.get("x", 0), 0.02, wp.get("z", 0))
+            for wp in self._waypoints
+        ], dtype=np.float32)
+
+        # Spheres at each waypoint
+        for i, (x, y, z) in enumerate(pts):
+            sphere = self._server.add_sphere(
+                f"/waypoints/marker/{i}",
+                radius=0.08,
+                color=WAYPOINT_COLOR,
+                position=(float(x), float(y), float(z)),
+            )
+            self._waypoint_handles.append(sphere)
+
+        # Line segments between consecutive waypoints
+        if len(pts) >= 2:
+            seg_verts: list[tuple[float, float, float]] = []
+            for i in range(len(pts) - 1):
+                a = (float(pts[i, 0]), float(pts[i, 1]), float(pts[i, 2]))
+                b = (float(pts[i + 1, 0]), float(pts[i + 1, 1]), float(pts[i + 1, 2]))
+                seg_verts.append(a)
+                seg_verts.append(b)
+
+            try:
+                self._waypoint_line = self._server.add_mesh_simple(
+                    "/waypoints/path/line",
+                    vertices=[
+                        (0, 0, 0), (0.005, 0, 0), (0.005, 0.005, 0), (0, 0.005, 0),
+                        (0, 0, 1), (0.005, 0, 1), (0.005, 0.005, 1), (0, 0.005, 1),
+                    ],
+                    faces=[
+                        (0, 1, 2), (0, 2, 3), (4, 5, 6), (4, 6, 7),
+                        (0, 1, 5), (0, 5, 4), (2, 3, 7), (2, 7, 6),
+                        (0, 3, 7), (0, 7, 4), (1, 2, 6), (1, 6, 5),
+                    ],
+                    color=WAYPOINT_LINE_COLOR,
+                )
+            except Exception:
+                pass
 
     # ---- per-frame update --------------------------------------------------
 
@@ -249,6 +346,9 @@ class ArdyViewer:
             handle.wxyz = (qw, qx, qy, qz)
             handle.scale = (1.0, length / 0.03, 1.0)
 
+        # Store root for follow camera
+        self._root_position = pos[0].copy()
+
     # ---- WebSocket loop ----------------------------------------------------
 
     async def _ws_loop(self):
@@ -260,7 +360,6 @@ class ArdyViewer:
                 async with websockets.connect(self.director_ws_url) as ws:
                     logger.info("Connected to director")
                     self._set_status("Connected — streaming")
-                    self._ready.set()
 
                     async for raw in ws:
                         msg = json.loads(raw)
@@ -275,9 +374,23 @@ class ArdyViewer:
                             posed = msg.get("posed_joints")
                             if posed is not None:
                                 self._update_pose(posed)
+                                self._apply_follow_camera(self._root_position)
 
                         elif mtype == "done":
                             self._set_status("Done — idle")
+
+                        elif mtype == "camera":
+                            cam = msg.get("camera", {})
+                            self._camera = cam
+                            self._update_cameras()
+                            logger.info("Camera: %s", cam.get("mode", "?"))
+
+                        elif mtype == "stage":
+                            stage = msg.get("stage", {})
+                            self._waypoints = stage.get("waypoints", [])
+                            self._render_waypoints()
+                            n = len(self._waypoints)
+                            logger.info("Stage: %d waypoints", n)
 
                         elif mtype == "error":
                             logger.error("Server error: %s", msg.get("message", ""))
@@ -287,7 +400,6 @@ class ArdyViewer:
             except Exception as exc:
                 logger.warning("Disconnected (%s), reconnecting in 3s ...", exc)
                 self._set_status("Disconnected — reconnecting...")
-                self._ready.clear()
                 await asyncio.sleep(3)
 
     async def run(self):
@@ -301,19 +413,15 @@ class ArdyViewer:
 def main():
     p = argparse.ArgumentParser(description="ARDY Director — Live Viewer")
     p.add_argument(
-        "--director",
-        default="ws://localhost:9600",
+        "--director", default="ws://localhost:9600",
         help="Director service URL (default: ws://localhost:9600)",
     )
     p.add_argument(
-        "--port",
-        type=int,
-        default=9601,
+        "--port", type=int, default=9601,
         help="Viser viewer port (default: 9601)",
     )
     p.add_argument(
-        "--skeleton",
-        default=None,
+        "--skeleton", default=None,
         help="Path to custom skeleton JSON (joint_names + bones)",
     )
     args = p.parse_args()
