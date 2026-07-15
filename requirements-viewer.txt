@@ -1,0 +1,4 @@
+# Viewer deps — install in the ARDY venv (or anywhere that runs the viewer)
+viser>=0.4
+websockets>=12
+numpy>=1.24
