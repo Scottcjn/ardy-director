@@ -72,18 +72,84 @@ Each call returns the path to an ARDY-native `.npz`, loadable in ARDY's own
 viewer (`scripts/visualize.py`) or renderable with your own skin (e.g. the
 N64-Sophia flat-color rig).
 
+## ARDY → Unreal Engine (FBX export + retarget)
+
+ARDY makes motion but renders nothing. Unreal Engine is the render layer —
+environments, lighting, cameras, photoreal / MetaHuman characters. Because the
+`core` skeleton uses Mixamo-style bone names (`Hips`, `Spine`, `LeftArm`,
+`LeftForeArm`, …), which is exactly what UE's **IK Retargeter** expects, an ARDY
+clip drops onto the UE5 Mannequin or a MetaHuman with no custom bone glue.
+
+### 1. Export a clip to FBX
+
+Every generated clip already bakes the joint positions, global rotations, the
+root track and the skeleton topology into its `.npz`, so the exporter is pure
+numpy — **no GPU, no model reload, no ARDY install**.
+
+```bash
+# straight off an .npz on disk:
+python scripts/export_fbx.py ~/ardy/outputs/director/<tag>.npz walk.fbx --scale 100
+
+# or pull it from a running service by tag:
+curl -o walk.fbx "http://<ARDY-host>:9600/export/<tag>.fbx?scale=100"
+```
+
+It writes an ASCII **FBX 7.4** file: one `LimbNode` per bone in the ARDY
+hierarchy, each bone's rest offset as its `Lcl Translation`, and a per-frame
+`Lcl Rotation` curve (plus a root `Lcl Translation` curve for locomotion). The
+math is the plain SMPL rigid transform ARDY already uses, so an FK replay of the
+FBX reproduces the clip's world-space joints exactly (the exporter tests assert
+this round-trip, and the CLI prints a `rigid check` drift that should read ~0).
+
+`--scale` / `?scale=` multiplies lengths. ARDY is metric; pass `100` for
+Unreal-native centimetres, or leave it at `1.0` and rescale in UE's import
+dialog. Works for the `core` (27-joint) and `soma` avatar skeletons; the `g1`
+robot model has no `posed_joints` avatar rig, so it is rejected with a clear
+error rather than a broken file.
+
+### 2. Import + IK Retarget onto the UE5 Mannequin
+
+1. **Import** `walk.fbx` (Content Browser → *Import*). Tick *Skeletal Mesh* and
+   *Import Animations*; leave *Convert Scene* on so UE maps our Y-up/Z-front
+   axes. You get a Skeletal Mesh, a Skeleton asset and an Animation Sequence.
+2. Create an **IK Rig** for the imported skeleton and one for the UE5 Mannequin
+   (`SK_Mannequin`) — right-click → *Create IK Rig*. In each, set the *Retarget
+   Root* to `Hips`/`pelvis` and add a *Retarget Chain* per limb (Spine, Head,
+   Arm L/R, Leg L/R). Because both skeletons use Mixamo-ish names, the chains
+   auto-name cleanly.
+3. Create an **IK Retargeter** with the ARDY IK Rig as *Source* and the
+   Mannequin IK Rig as *Target*. Confirm the chain mapping (spine→spine,
+   leftarm→leftarm, …).
+4. Right-click the ARDY Animation Sequence → *Retarget Animations* → pick the
+   retargeter → export. The result plays on the Mannequin.
+
+### 3. MetaHuman (bonus)
+
+A MetaHuman ships with its own IK Rig (`IK_metahuman`). Build a second
+Retargeter with the ARDY IK Rig as *Source* and the MetaHuman IK Rig as
+*Target*, map the same chains, and retarget the same sequence — no re-export
+needed. (Set the MetaHuman body's *Post-Process* to the retargeted anim, or bake
+to an Animation Sequence for Sequencer.)
+
+> Tooling note: FBX generation and the numeric correctness of the export are
+> covered by `tests/test_fbx_export.py` (round-trip FK + re-parse), which runs
+> headless. The in-engine screen capture of a clip on the Mannequin needs a GPU
+> host (to generate a clip) plus a UE5 install; run the two commands in step 1
+> on such a host and the FBX drops straight into the recipe above.
+
 ## MCP tools
 
 | Tool | Purpose |
 |------|---------|
 | `ardy_generate` | One clip from one prompt (`core` avatar or `g1` robot). |
 | `ardy_choreograph` | A prompt sequence stitched into one continuous clip. |
+| `ardy_export_fbx` | Export a clip tag to an FBX for Unreal / Maya / Blender. |
 | `ardy_list_models` | List motion models (core vs G1). |
 | `ardy_status` | Service health: device, loaded models, encoder link. |
 
 ## Roadmap
 
-- **v0.1 (now):** generate + position-chained choreography, model caching, encoder reuse.
+- **v0.1 (now):** generate + position-chained choreography, model caching, encoder reuse, FBX export to Unreal / Maya.
 - **Streaming choreography:** velocity-smooth seams via ARDY's `autoregressive_step` (change the prompt mid-stream instead of stitching segments).
 - **Live viewer injection:** push directed motion straight into the running viser demo.
 - **Scene generation:** the larger goal — compose full visual scenes (camera, staging, multiple characters, background) around ARDY's demo, with the LLM as director.
