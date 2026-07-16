@@ -72,19 +72,56 @@ Each call returns the path to an ARDY-native `.npz`, loadable in ARDY's own
 viewer (`scripts/visualize.py`) or renderable with your own skin (e.g. the
 N64-Sophia flat-color rig).
 
+`ardy_choreograph` **streams**: each beat is generated on top of the motion
+already in flight (ARDY's `autoregressive_step`), so the character carries its
+momentum through a prompt change instead of popping at the boundary. Beat
+durations are rounded to the model's generation horizon — the response reports
+the frames each beat actually got, plus the measured root-velocity jump at every
+prompt change:
+
+```json
+{"frames": 210, "duration_s": 7.0, "mode": "stream",
+ "segments":   [{"prompt": "walk to the desk", "frames": 90, "duration_s": 3.0}, ...],
+ "seam_frames": [90, 150],
+ "seam_velocity": {"baseline_jump": 0.031, "max_ratio": 1.2,
+                   "seams": [{"frame": 90, "time_s": 3.0, "jump": 0.037, "ratio": 1.2}]}}
+```
+
+`ratio` is how many times harder the root's velocity changes at the seam than on
+a typical frame of the same clip: ~1 means the seam is indistinguishable from
+ordinary motion, large means a visible pop.
+
+### Checking the seams yourself
+
+`mode: "stitch"` reproduces v0.1's behaviour (independent clips glued by root
+offset) so the two can be compared on the same seed:
+
+```bash
+for m in stitch stream; do
+  curl -s localhost:9600/choreograph -H 'content-type: application/json' \
+    -d "{\"seed\":42,\"mode\":\"$m\",\"steps\":[
+          {\"prompt\":\"walk forward confidently\",\"duration\":3},
+          {\"prompt\":\"stop and turn around\",\"duration\":2}]}" | jq -r .npz
+done
+python scripts/seam_report.py <stream.npz> --before <stitch.npz> --plot seams.png
+```
+
+The `.npz` carries its own seam frames, so the report needs nothing but the
+files. matplotlib is optional — without it you still get the numbers.
+
 ## MCP tools
 
 | Tool | Purpose |
 |------|---------|
 | `ardy_generate` | One clip from one prompt (`core` avatar or `g1` robot). |
-| `ardy_choreograph` | A prompt sequence stitched into one continuous clip. |
+| `ardy_choreograph` | A prompt sequence streamed into one continuous clip, velocity-smooth across beats. |
 | `ardy_list_models` | List motion models (core vs G1). |
 | `ardy_status` | Service health: device, loaded models, encoder link. |
 
 ## Roadmap
 
-- **v0.1 (now):** generate + position-chained choreography, model caching, encoder reuse.
-- **Streaming choreography:** velocity-smooth seams via ARDY's `autoregressive_step` (change the prompt mid-stream instead of stitching segments).
+- **v0.1:** generate + position-chained choreography, model caching, encoder reuse.
+- **Streaming choreography (now):** velocity-smooth seams via ARDY's `autoregressive_step` — the prompt changes mid-stream instead of segments being stitched.
 - **Live viewer injection:** push directed motion straight into the running viser demo.
 - **Scene generation:** the larger goal — compose full visual scenes (camera, staging, multiple characters, background) around ARDY's demo, with the LLM as director.
 
