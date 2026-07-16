@@ -72,6 +72,35 @@ Each call returns the path to an ARDY-native `.npz`, loadable in ARDY's own
 viewer (`scripts/visualize.py`) or renderable with your own skin (e.g. the
 N64-Sophia flat-color rig).
 
+### Web prompting engine (no file juggling)
+
+The service also ships a single-page front end — type a prompt (or a sequence of
+beats), hit go, and watch the character move in the browser. Open it once the
+service is up:
+
+```
+http://<ARDY-host>:9600/ui/          #   / redirects here
+```
+
+- **Single prompt** or **Choreograph** mode (add beats, reorder with ↑/↓, run as
+  one continuous clip). Controls for duration, model (`core`/`soma`/`g1`), seed
+  and initial facing.
+- A three.js viewport plays the returned motion as a stick figure with
+  play/pause and a frame scrubber; choreograph seams (prompt changes) are marked.
+- If you serve the page from somewhere other than the ARDY host, point it at the
+  service with `/ui/?api=http://<host>:9600`.
+
+It is glue over the existing API, so it needs no extra service state:
+
+| Route | Purpose |
+| --- | --- |
+| `GET /ui/` | the static SPA |
+| `GET /motion/{tag}` | a generated clip as JSON (`posed_joints` + skeleton parents) for the viewport; `?stride=N` thins frames for slow links |
+
+`/generate` and `/choreograph` now also return a `tag` the UI fetches motion by;
+the joint names and parent table are stored in the `.npz` at generation time, so
+replaying a clip never reloads the model.
+
 ## MCP tools
 
 | Tool | Purpose |
