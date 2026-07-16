@@ -1,0 +1,20 @@
+{
+  "_comment": "POST this to /generate. The character starts at the door mark, is at the desk (0, 4) at 3s and by the window (3, 6) at 5s; a follow camera trails it. See README 'Stage a shot'.",
+  "prompt": "walk to the desk, pause, then walk to the window",
+  "model": "core",
+  "duration": 6.0,
+  "seed": 42,
+  "stage": {
+    "start": {"x": 0.0, "z": 0.0},
+    "dense_path": true,
+    "waypoints": [
+      {"x": 0.0, "z": 4.0, "at": 3.0},
+      {"x": 3.0, "z": 6.0, "at": 5.0}
+    ]
+  },
+  "camera": {
+    "mode": "follow",
+    "distance": 5.0,
+    "height": 2.5
+  }
+}

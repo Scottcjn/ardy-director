@@ -14,11 +14,17 @@ copy of Llama-3.
 Endpoints:
   GET  /health                      -> liveness + loaded models + device
   GET  /models                      -> known model nicknames
+  GET  /cameras                     -> camera modes + their parameters
   POST /generate    {prompt,...}    -> one clip from one prompt
   POST /choreograph {steps:[...]}   -> one clip stitched from a prompt sequence
+  POST /stage/preview {stage,...}   -> the staged path + camera track, no GPU
 
 Motion is written as ARDY-native .npz under OUTPUT_DIR and the path is returned,
 so ARDY's own viewer (scripts/visualize.py) can load it.
+
+A request may also stage the shot: `stage` places the character (start position
+plus timed waypoints, fed to ARDY as root-path constraints so it actually walks
+the path) and `camera` bakes a per-frame camera track into the .npz.
 """
 import os
 import threading
@@ -30,9 +36,17 @@ import torch
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from ardy.constraints import Root2DConstraintSet
 from ardy.model.load_model import load_model, load_text_encoder
 from ardy.model.registry import resolve_model_name
 from ardy.postprocess import post_process_motion
+
+try:  # README launches this file as a script; tests import it as a package.
+    from . import camera as camera_mod
+    from . import staging
+except ImportError:  # pragma: no cover - script mode puts this dir on sys.path
+    import camera as camera_mod
+    import staging
 
 OUTPUT_DIR = os.environ.get("DIRECTOR_OUTPUT_DIR", os.path.expanduser("~/ardy/outputs/director"))
 ENCODER_URL = os.environ.get("DIRECTOR_ENCODER_URL", "http://localhost:9550")
@@ -65,8 +79,15 @@ def _get_model(nickname: str):
 
 
 def _generate_clip(model, resolved_name, prompt, num_frames, diffusion_steps,
-                   cfg_weight, seed, first_heading_angle, history_frames):
-    """One synchronous ARDY generation → numpy motion dict (single sample)."""
+                   cfg_weight, seed, first_heading_angle, history_frames,
+                   constraint_lst=None):
+    """One synchronous ARDY generation → numpy motion dict (single sample).
+
+    `constraint_lst` (e.g. a staged root path) is turned into ARDY's observed
+    motion + mask, exactly as scripts/generate.py does, and is also handed to
+    the post-processor so the foot fix-up respects the constraint instead of
+    fighting it.
+    """
     if seed is not None:
         torch.manual_seed(seed)
         np.random.seed(seed)
@@ -75,6 +96,12 @@ def _generate_clip(model, resolved_name, prompt, num_frames, diffusion_steps,
     pad_mask = torch.ones((1, num_frames), dtype=torch.bool, device=DEVICE)
     heading = torch.tensor([first_heading_angle], dtype=torch.float, device=DEVICE)
 
+    observed_motion, motion_mask = None, None
+    if constraint_lst:
+        observed_motion, motion_mask = model.motion_rep.create_conditions_from_constraints_batched(
+            constraint_lst, lengths, to_normalize=True, device=DEVICE,
+        )
+
     with torch.no_grad():
         motion = model(
             [prompt.strip()],
@@ -82,8 +109,8 @@ def _generate_clip(model, resolved_name, prompt, num_frames, diffusion_steps,
             num_denoising_steps=diffusion_steps,
             pad_mask=pad_mask,
             first_heading_angle=heading,
-            motion_mask=None,
-            observed_motion=None,
+            motion_mask=motion_mask,
+            observed_motion=observed_motion,
             cfg_weight=cfg_weight,
             crop_history_length=history_frames,
         )
@@ -92,7 +119,7 @@ def _generate_clip(model, resolved_name, prompt, num_frames, diffusion_steps,
     if "g1" not in resolved_name.lower():
         corrected = post_process_motion(
             out["local_rot_mats"], out["root_positions"], out["foot_contacts"],
-            model.skeleton, constraint_lst=None,
+            model.skeleton, constraint_lst=constraint_lst or None,
         )
         out.update(corrected)
 
@@ -112,7 +139,92 @@ def _save_npz(motion, fps, text, tag):
     return path
 
 
+# --- staging / camera bridge -------------------------------------------------
+def _build_root_constraints(model, plan, face_path=False):
+    """numpy staging plan → ARDY's Root2DConstraintSet on the model's skeleton.
+
+    Position only by default, which is what ARDY's own interactive demo
+    constrains (scripts/interactive_demo/gen_constraints.py): pinning the facing
+    every frame as well would forbid the character from turning on the spot at a
+    mark, so `face_path` is opt-in. When it is on, ARDY reads the facing as an
+    angle (Root2DConstraintSet.update_constraints takes cos/sin of what it is
+    given), so the plan's radians go through as-is.
+    """
+    device = DEVICE
+    frame_indices = torch.tensor(plan["frame_indices"], dtype=torch.long)
+    root_2d = torch.tensor(plan["root_2d"], dtype=torch.float, device=device)
+    headings = None
+    if face_path:
+        headings = torch.tensor(plan["headings"], dtype=torch.float, device=device)
+    return [Root2DConstraintSet(model.skeleton, frame_indices, root_2d, global_root_heading=headings)]
+
+
+def _plan_stage(stage, fps, num_frames):
+    """Validate + plan, turning a staging complaint into a 400 rather than a 500."""
+    try:
+        return staging.plan_root_path(
+            [wp.model_dump() for wp in stage.waypoints],
+            fps=fps, num_frames=num_frames,
+            start=(stage.start.x, stage.start.z), dense=stage.dense_path,
+        )
+    except staging.StagingError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+def _solve_camera(cam, root_positions, fps):
+    try:
+        return camera_mod.solve_camera_track(
+            cam.mode, root_positions, fps,
+            distance=cam.distance, height=cam.height, side=cam.side,
+            look_height=cam.look_height, look_ahead=cam.look_ahead,
+            orbit_deg_per_s=cam.orbit_deg_per_s, orbit_start_deg=cam.orbit_start_deg,
+            smoothing=cam.smoothing, position=cam.position, look_at=cam.look_at,
+        )
+    except camera_mod.CameraError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+def _attach_camera(motion, track):
+    motion["camera_positions"] = track["positions"]
+    motion["camera_targets"] = track["targets"]
+    motion["camera_mode"] = np.array(track["mode"])
+
+
 # --- request models ----------------------------------------------------------
+class Waypoint(BaseModel):
+    x: float
+    z: float
+    at: float = Field(..., gt=0.0, description="seconds from the clip start")
+
+
+class StartPos(BaseModel):
+    x: float = 0.0
+    z: float = 0.0
+
+
+class Stage(BaseModel):
+    """Where the action happens: a start mark and timed waypoints."""
+    waypoints: list[Waypoint] = Field(..., min_length=1)
+    start: StartPos = StartPos()
+    dense_path: bool = True  # constrain every frame (a walked path) vs. the marks only
+    face_path: bool = False  # also pin the facing along the path (stops it turning on the spot)
+
+
+class Camera(BaseModel):
+    """How the shot is framed. Baked per frame into the output .npz."""
+    mode: str = "follow"  # follow | orbit | fixed | over_the_shoulder
+    distance: float | None = None
+    height: float | None = None
+    side: float | None = None
+    look_height: float | None = None
+    look_ahead: float | None = None
+    orbit_deg_per_s: float | None = None
+    orbit_start_deg: float | None = None
+    smoothing: float | None = None
+    position: list[float] | None = None  # fixed mode: the tripod, [x, y, z]
+    look_at: list[float] | None = None   # fixed mode: aim point; omit to track the character
+
+
 class GenerateReq(BaseModel):
     prompt: str
     model: str = "core"
@@ -120,7 +232,9 @@ class GenerateReq(BaseModel):
     seed: int | None = None
     diffusion_steps: int | None = None
     cfg_weight: float = 4.0
-    heading_deg: float = 0.0  # initial facing, degrees about +Y (0 = +Z)
+    heading_deg: float | None = None  # initial facing, degrees about +Y (0 = +Z)
+    stage: Stage | None = None
+    camera: Camera | None = None
 
 
 class ChoreoStep(BaseModel):
@@ -134,6 +248,15 @@ class ChoreographReq(BaseModel):
     seed: int | None = None
     diffusion_steps: int | None = None
     cfg_weight: float = 4.0
+    camera: Camera | None = None
+
+
+class StagePreviewReq(BaseModel):
+    """Dry-run staging: no prompt, no model, no GPU."""
+    stage: Stage
+    duration: float = Field(4.0, gt=0.1, le=30.0)
+    camera: Camera | None = None
+    fps: int = Field(30, gt=0, le=240, description="frame rate to plan against (the core model is 30)")
 
 
 # --- endpoints ---------------------------------------------------------------
@@ -155,6 +278,42 @@ def models():
             "note": "core=27-joint avatar (default), g1=Unitree G1 robot (MuJoCo qpos)."}
 
 
+@app.get("/cameras")
+def cameras():
+    return {"modes": list(camera_mod.MODES), "defaults": camera_mod.DEFAULTS,
+            "params": {m: list(p) for m, p in camera_mod.PARAMS_FOR.items()},
+            "note": "Camera is baked per frame into the .npz as camera_positions/camera_targets."}
+
+
+@app.post("/stage/preview")
+def stage_preview(req: StagePreviewReq):
+    """Plan a stage without generating: the root path ARDY would be given, and
+    the camera track that path implies. No model load, no GPU — cheap enough to
+    iterate on the blocking before spending a generation.
+
+    The camera here is solved against the *planned* path (a straight walk
+    between marks); the real shot is solved against ARDY's actual motion, so
+    expect the preview to be the intent, not the frame-exact result.
+    """
+    fps = req.fps
+    num_frames = int(req.duration * fps)
+    plan = _plan_stage(req.stage, fps, num_frames)
+    out = {"ok": True, "fps": fps, "frames": num_frames, "duration_s": req.duration,
+           "dense_path": req.stage.dense_path, "stage": staging.summarize(plan, fps),
+           "root_path": [[round(float(x), 4), round(float(z), 4)] for x, z in plan["root_2d"]],
+           "frame_indices": [int(i) for i in plan["frame_indices"]]}
+    if req.camera:
+        # Planned path is XZ on the ground; give the camera solver a 3D root.
+        root3 = np.zeros((len(plan["root_2d"]), 3), dtype=np.float64)
+        root3[:, [0, 2]] = plan["root_2d"]
+        track = _solve_camera(req.camera, root3, fps)
+        out["camera"] = {"mode": track["mode"], "params": track["params"],
+                         "first_position": [round(float(v), 4) for v in track["positions"][0]],
+                         "last_position": [round(float(v), 4) for v in track["positions"][-1]],
+                         "frames": int(len(track["positions"]))}
+    return out
+
+
 @app.post("/generate")
 def generate(req: GenerateReq):
     try:
@@ -164,12 +323,35 @@ def generate(req: GenerateReq):
         steps = req.diffusion_steps or int(model.diffusion.num_base_steps)
         patch = model.num_frames_per_token
         hist = (int(round(10 * fps)) // patch) * patch  # trained ~10s window
+
+        constraint_lst, plan = None, None
+        heading_deg = req.heading_deg
+        if req.stage:
+            plan = _plan_stage(req.stage, fps, num_frames)
+            constraint_lst = _build_root_constraints(model, plan, face_path=req.stage.face_path)
+            if heading_deg is None:
+                # Face the way the staged path leaves the start mark, unless the
+                # director overrode it.
+                heading_deg = float(np.rad2deg(plan["headings"][0]))
+        heading_deg = 0.0 if heading_deg is None else heading_deg
+
         motion = _generate_clip(model, resolved, req.prompt, num_frames, steps,
-                                req.cfg_weight, req.seed, np.deg2rad(req.heading_deg), hist)
+                                req.cfg_weight, req.seed, np.deg2rad(heading_deg), hist,
+                                constraint_lst=constraint_lst)
+        result = {"ok": True, "model": resolved, "fps": int(fps), "frames": num_frames,
+                  "duration_s": req.duration, "prompt": req.prompt,
+                  "heading_deg": round(float(heading_deg), 2)}
+        if plan:
+            result["stage"] = staging.summarize(plan, fps)
+        if req.camera:
+            track = _solve_camera(req.camera, motion["root_positions"], fps)
+            _attach_camera(motion, track)
+            result["camera"] = {"mode": track["mode"], "params": track["params"]}
         tag = f"gen_{int(time.time())}_{uuid.uuid4().hex[:6]}"
-        path = _save_npz(motion, fps, req.prompt, tag)
-        return {"ok": True, "model": resolved, "fps": int(fps), "frames": num_frames,
-                "duration_s": req.duration, "npz": path, "prompt": req.prompt}
+        result["npz"] = _save_npz(motion, fps, req.prompt, tag)
+        return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
@@ -215,11 +397,19 @@ def choreograph(req: ChoreographReq):
             labels.append(st.prompt)
 
         motion = {k: np.concatenate(v, axis=0) for k, v in acc.items() if v}
+        result = {"ok": True, "model": resolved, "fps": int(fps),
+                  "segments": len(req.steps), "sequence": labels}
+        if req.camera:
+            # Solve over the whole stitched path so the shot carries across seams.
+            track = _solve_camera(req.camera, motion["root_positions"], fps)
+            _attach_camera(motion, track)
+            result["camera"] = {"mode": track["mode"], "params": track["params"]}
         tag = f"choreo_{int(time.time())}_{uuid.uuid4().hex[:6]}"
-        path = _save_npz(motion, fps, " | ".join(labels), tag)
-        total = int(sum(int(s.duration * fps) for s in req.steps))
-        return {"ok": True, "model": resolved, "fps": int(fps), "frames": total,
-                "segments": len(req.steps), "npz": path, "sequence": labels}
+        result["npz"] = _save_npz(motion, fps, " | ".join(labels), tag)
+        result["frames"] = int(sum(int(s.duration * fps) for s in req.steps))
+        return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
