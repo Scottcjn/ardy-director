@@ -81,11 +81,59 @@ N64-Sophia flat-color rig).
 | `ardy_list_models` | List motion models (core vs G1). |
 | `ardy_status` | Service health: device, loaded models, encoder link. |
 
+## Custom avatars (bring your own Blender humanoid)
+
+ARDY ships one hand-rigged avatar. `scripts/rig_avatar.py` turns any Blender
+humanoid into an ARDY-compatible skin automatically — no GPU, no ARDY install,
+numpy only.
+
+```bash
+# Export your humanoid from Blender in a neutral T-pose as OBJ, with
+# "Objects/Groups as OBJ groups" on (so each body part carries a label).
+python scripts/rig_avatar.py my_avatar.obj skin_standard.npz --color
+
+# View it: the stock viewer loads the core skin from the cskel27 asset folder,
+# so back up the bundled skin and swap yours in.
+cd /path/to/ardy
+cp assets/skeletons/cskel27/skin_standard.npz assets/skeletons/cskel27/skin_standard.bak.npz
+cp /path/to/skin_standard.npz assets/skeletons/cskel27/skin_standard.npz
+python scripts/visualize.py CLIP.npz            # character now wears your mesh
+
+# (or, in code, point the skeleton at any folder holding joints.p + your skin:)
+#   CoreSkeleton27(folder="my_skel")   # my_skel/ = joints.p (copied) + skin_standard.npz
+```
+
+What it does automatically:
+
+- **Up-axis + scale fit** — Blender Z-up → ARDY Y-up, uniform-scaled to the
+  core skeleton's height, feet dropped to the floor.
+- **Part → joint mapping** onto the 27-joint core skeleton, understanding
+  Mixamo (`LeftForeArm`), Rigify/`.L`-`.R` (`upper_arm.L`), MakeHuman and plain
+  `arm_left` names. Left/right comes from the label, or from vertex geometry
+  when the label is unsided.
+- **Skinning** — rigid per-part by default, or `--smooth` for inverse-distance
+  blended seams. An unlabeled mesh falls back to nearest-bone geometry.
+- **Optional flat limb colors** with `--color`.
+
+The emitted `skin_standard.npz` reuses the canonical `bind_rig_transform` /
+`rig_joint_names` / bone edges verbatim, so ARDY's viewer loads it with no
+joint-name mismatch and every generated clip deforms it correctly.
+
+Worked example (a second avatar besides the bundled one):
+
+```bash
+python examples/custom_avatar/make_blocky_humanoid.py      # writes the OBJ
+python scripts/rig_avatar.py examples/custom_avatar/blocky_humanoid.obj \
+       examples/custom_avatar/skin_standard.npz --color
+python tests/test_avatar_rig.py                            # headless checks
+```
+
 ## Roadmap
 
 - **v0.1 (now):** generate + position-chained choreography, model caching, encoder reuse.
 - **Streaming choreography:** velocity-smooth seams via ARDY's `autoregressive_step` (change the prompt mid-stream instead of stitching segments).
 - **Live viewer injection:** push directed motion straight into the running viser demo.
+- **Custom avatars (done):** `scripts/rig_avatar.py` rigs any Blender humanoid onto the core skeleton (see above).
 - **Scene generation:** the larger goal — compose full visual scenes (camera, staging, multiple characters, background) around ARDY's demo, with the LLM as director.
 
 ## License
