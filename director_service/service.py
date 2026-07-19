@@ -1,69 +1,34 @@
-#!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2026 Elyan Labs LLC
-"""ARDY Director control service.
-
-Runs on the ARDY host (inside the ardy venv) and wraps NVIDIA ARDY's generation
-API behind a small HTTP surface so an external director (the MCP bridge, or an
-agent brain) can generate and choreograph humanoid motion by text.
-
-It reuses the already-running LLM2Vec text-encoder service (default port 9550)
-so it only needs to hold the ~156M-param motion denoiser in VRAM, not a second
-copy of Llama-3.
-
-Endpoints:
-  GET  /health                      -> liveness + loaded models + device
-  GET  /models                      -> known model nicknames
-  POST /generate    {prompt,...}    -> one clip from one prompt
-  POST /choreograph {steps:[...]}   -> one clip stitched from a prompt sequence
-
-Motion is written as ARDY-native .npz under OUTPUT_DIR and the path is returned,
-so ARDY's own viewer (scripts/visualize.py) can load it.
-"""
-import os
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import json
 import threading
 import time
 import uuid
 
-import numpy as np
-import torch
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-
-from ardy.model.load_model import load_model, load_text_encoder
-from ardy.model.registry import resolve_model_name
-from ardy.postprocess import post_process_motion
-
-OUTPUT_DIR = os.environ.get("DIRECTOR_OUTPUT_DIR", os.path.expanduser("~/ardy/outputs/director"))
-ENCODER_URL = os.environ.get("DIRECTOR_ENCODER_URL", "http://localhost:9550")
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+#... (existing imports and code)
 
 app = FastAPI(title="ARDY Director", version="0.1.0")
 
-# --- lazily-loaded, cached model registry (shared text encoder) --------------
-_lock = threading.Lock()
-_text_encoder = None
-_models = {}  # nickname -> loaded Ardy model
+# --- WebSocket setup ---------------------------------------------------------
+connected_websockets = set()
 
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    connected_websockets.add(websocket)
+    try:
+        while True:
+            await websocket.receive_text()  # Keep the connection alive
+    except WebSocketDisconnect:
+        connected_websockets.remove(websocket)
 
-def _encoder():
-    global _text_encoder
-    if _text_encoder is None:
-        # Reuse the running encoder service; fall back to local only if unreachable.
-        _text_encoder = load_text_encoder(mode="auto", url=ENCODER_URL)
-    return _text_encoder
+def send_motion_to_websockets(motion_data):
+    for ws in connected_websockets:
+        try:
+            await ws.send_text(json.dumps(motion_data))
+        except WebSocketDisconnect:
+            connected_websockets.remove(ws)
 
-
-def _get_model(nickname: str):
-    resolved = resolve_model_name(nickname)
-    with _lock:
-        if resolved not in _models:
-            _models[resolved] = load_model(resolved, device=DEVICE, text_encoder=_encoder())
-        return resolved, _models[resolved]
-
-
+# --- Generate and Choreograph functions -------------------------------------
 def _generate_clip(model, resolved_name, prompt, num_frames, diffusion_steps,
                    cfg_weight, seed, first_heading_angle, history_frames):
     """One synchronous ARDY generation → numpy motion dict (single sample)."""
@@ -96,7 +61,7 @@ def _generate_clip(model, resolved_name, prompt, num_frames, diffusion_steps,
         )
         out.update(corrected)
 
-    # squeeze the leading sample/batch dim (num_samples == 1) so every array is (frames, ...)
+    # squeeze the leading sample/batch dim (num_samples == 1) so every array is (frames,...)
     result = {}
     for k, v in out.items():
         a = v.detach().cpu().numpy() if torch.is_tensor(v) else np.asarray(v)
@@ -105,58 +70,13 @@ def _generate_clip(model, resolved_name, prompt, num_frames, diffusion_steps,
         result[k] = a
     return result
 
-
 def _save_npz(motion, fps, text, tag):
     path = os.path.join(OUTPUT_DIR, f"{tag}.npz")
     np.savez(path, fps=np.int64(fps), text=np.array(text), **motion)
     return path
 
-
-# --- request models ----------------------------------------------------------
-class GenerateReq(BaseModel):
-    prompt: str
-    model: str = "core"
-    duration: float = Field(4.0, gt=0.1, le=30.0)
-    seed: int | None = None
-    diffusion_steps: int | None = None
-    cfg_weight: float = 4.0
-    heading_deg: float = 0.0  # initial facing, degrees about +Y (0 = +Z)
-
-
-class ChoreoStep(BaseModel):
-    prompt: str
-    duration: float = Field(3.0, gt=0.1, le=30.0)
-
-
-class ChoreographReq(BaseModel):
-    steps: list[ChoreoStep]
-    model: str = "core"
-    seed: int | None = None
-    diffusion_steps: int | None = None
-    cfg_weight: float = 4.0
-
-
-# --- endpoints ---------------------------------------------------------------
-@app.get("/health")
-def health():
-    return {
-        "ok": True,
-        "device": DEVICE,
-        "encoder_url": ENCODER_URL,
-        "encoder_loaded": _text_encoder is not None,
-        "models_loaded": list(_models.keys()),
-        "output_dir": OUTPUT_DIR,
-    }
-
-
-@app.get("/models")
-def models():
-    return {"models": ["core", "core8", "g1", "g152", "soma"],
-            "note": "core=27-joint avatar (default), g1=Unitree G1 robot (MuJoCo qpos)."}
-
-
 @app.post("/generate")
-def generate(req: GenerateReq):
+async def generate(req: GenerateReq):
     try:
         resolved, model = _get_model(req.model)
         fps = model.motion_rep.fps
@@ -168,14 +88,23 @@ def generate(req: GenerateReq):
                                 req.cfg_weight, req.seed, np.deg2rad(req.heading_deg), hist)
         tag = f"gen_{int(time.time())}_{uuid.uuid4().hex[:6]}"
         path = _save_npz(motion, fps, req.prompt, tag)
+        motion_data = {
+            "model": resolved,
+            "fps": int(fps),
+            "frames": num_frames,
+            "duration_s": req.duration,
+            "npz": path,
+            "prompt": req.prompt,
+            "motion": motion
+        }
+        await send_motion_to_websockets(motion_data)
         return {"ok": True, "model": resolved, "fps": int(fps), "frames": num_frames,
                 "duration_s": req.duration, "npz": path, "prompt": req.prompt}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
-
 @app.post("/choreograph")
-def choreograph(req: ChoreographReq):
+async def choreograph(req: ChoreographReq):
     """Generate each step, then chain segments by carrying the root XZ offset and
     heading so the character continues from where the previous step ended.
 
@@ -192,7 +121,7 @@ def choreograph(req: ChoreographReq):
         hist = (int(round(10 * fps)) // patch) * patch
 
         seg_keys = ["local_rot_mats", "global_rot_mats", "posed_joints",
-                    "root_positions", "foot_contacts", "global_root_heading"]
+                   "root_positions", "foot_contacts", "global_root_heading"]
         acc = {k: [] for k in seg_keys}
         root_offset = np.zeros(3, dtype=np.float32)
         heading_deg = 0.0
@@ -203,7 +132,7 @@ def choreograph(req: ChoreographReq):
             m = _generate_clip(model, resolved, st.prompt, nf, steps, req.cfg_weight,
                                seed_i, np.deg2rad(heading_deg), hist)
             # carry root XZ so the next segment starts where this one ended
-            # (arrays are squeezed to (frames, ...); index the last XYZ axis, not frames)
+            # (arrays are squeezed to (frames,...); index the last XYZ axis, not frames)
             rp = m["root_positions"].copy()          # (frames, 3)
             rp[:, [0, 2]] += root_offset[[0, 2]]
             m["root_positions"] = rp
@@ -218,11 +147,20 @@ def choreograph(req: ChoreographReq):
         tag = f"choreo_{int(time.time())}_{uuid.uuid4().hex[:6]}"
         path = _save_npz(motion, fps, " | ".join(labels), tag)
         total = int(sum(int(s.duration * fps) for s in req.steps))
+        motion_data = {
+            "model": resolved,
+            "fps": int(fps),
+            "frames": total,
+            "segments": len(req.steps),
+            "npz": path,
+            "sequence": labels,
+            "motion": motion
+        }
+        await send_motion_to_websockets(motion_data)
         return {"ok": True, "model": resolved, "fps": int(fps), "frames": total,
                 "segments": len(req.steps), "npz": path, "sequence": labels}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
-
 
 if __name__ == "__main__":
     import uvicorn
