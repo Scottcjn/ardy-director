@@ -72,18 +72,106 @@ Each call returns the path to an ARDY-native `.npz`, loadable in ARDY's own
 viewer (`scripts/visualize.py`) or renderable with your own skin (e.g. the
 N64-Sophia flat-color rig).
 
+## Stage a shot
+
+A prompt says *what* the character does; it does not say **where** it happens or
+**where the shot is looking from**. Staging adds both:
+
+- **Waypoints** — marks on the floor with times (`{"x": 0, "z": 4, "at": 3}`).
+  They become ARDY root-path constraints (`Root2DConstraintSet`), so the
+  character actually walks the path instead of wandering wherever the prompt
+  takes it. `start` places it at frame 0, and it starts out facing the way the
+  path leaves that mark. The post-processor is told about the constraint too, so
+  the foot fix-up works with the path rather than against it.
+- **A camera** — `follow`, `orbit`, `fixed` or `over_the_shoulder`, baked per
+  frame into the `.npz` (`camera_positions`, `camera_targets`, `camera_mode`),
+  solved against the motion ARDY actually produced.
+
+### Worked example: walk to the desk, then to the window, on a follow camera
+
+First **preview** the blocking. This costs nothing — no model, no GPU — so you
+can fix the staging before you pay for a generation:
+
+```bash
+curl -s localhost:9600/stage/preview -H 'content-type: application/json' -d '{
+  "duration": 6.0,
+  "stage": {"start": {"x": 0, "z": 0},
+            "waypoints": [{"x": 0, "z": 4, "at": 3}, {"x": 3, "z": 6, "at": 5}]},
+  "camera": {"mode": "follow"}
+}'
+```
+
+```json
+{"ok": true, "fps": 30, "frames": 180,
+ "stage": {"constrained_frames": 151, "last_frame": 150, "last_time_s": 5.0,
+           "path_length_m": 7.606, "start_heading_deg": 0.0, "mean_speed_mps": 1.521},
+ "camera": {"mode": "follow", "first_position": [0.0, 2.5, -5.0], ...}}
+```
+
+`mean_speed_mps: 1.521` is a brisk walk — the marks are reachable. Ask for the
+same path in half the time and ARDY would be told to sprint; the preview is
+where you notice. A stage that cannot work (a waypoint past the end of the clip,
+times out of order) comes back as a `400` naming the problem, not a shrug.
+
+Happy with it? Send the same `stage` to `/generate` (see
+[`examples/staged_shot.json`](examples/staged_shot.json)):
+
+```bash
+curl -s localhost:9600/generate -H 'content-type: application/json' \
+     -d @examples/staged_shot.json
+```
+
+From an agent, that whole loop is two tools:
+
+```
+ardy_preview_stage(waypoints=[{"x":0,"z":4,"at":3},{"x":3,"z":6,"at":5}], duration=6, camera_mode="follow")
+ardy_stage(prompt="walk to the desk, pause, then walk to the window",
+           waypoints=[{"x":0,"z":4,"at":3},{"x":3,"z":6,"at":5}],
+           camera_mode="follow", duration=6, seed=42)
+```
+
+Two knobs worth knowing:
+
+- `dense_path: false` constrains only the marks and lets ARDY choose the route
+  between them; the default (`true`) walks the straight line.
+- `face_path: true` also pins the facing along the path. It is **off** by
+  default, matching ARDY's own interactive demo, which constrains position only
+  — pinning the facing every frame forbids the character from turning on the
+  spot at a mark ("walk to the desk, then turn and wave"). Turn it on when you
+  want the facing nailed down and the prompt is a pure travel beat.
+
 ## MCP tools
 
 | Tool | Purpose |
 |------|---------|
 | `ardy_generate` | One clip from one prompt (`core` avatar or `g1` robot). |
-| `ardy_choreograph` | A prompt sequence stitched into one continuous clip. |
+| `ardy_choreograph` | A prompt sequence stitched into one continuous clip (optional `camera_mode`). |
+| `ardy_stage` | A staged shot: walk a waypoint path, framed by a camera. |
+| `ardy_preview_stage` | Dry-run a stage (path, speed, camera) with no model and no GPU. |
+| `ardy_list_cameras` | Camera modes and their tunable parameters. |
 | `ardy_list_models` | List motion models (core vs G1). |
 | `ardy_status` | Service health: device, loaded models, encoder link. |
+
+## Tests
+
+The staging geometry and camera solving are plain numpy — no ARDY, no GPU — so
+they run anywhere:
+
+```bash
+pip install pytest httpx      # plus the service requirements
+python -m pytest tests/
+```
+
+ARDY itself is stubbed at import time (`tests/conftest.py`); nothing here fakes
+ARDY's behaviour, so anything the tests assert about generation is a contract
+with its API (constraint shapes and dtypes, what gets passed to the model), not
+a claim about the motion it returns.
 
 ## Roadmap
 
 - **v0.1 (now):** generate + position-chained choreography, model caching, encoder reuse.
+- **Staging and camera (now):** waypoint root-path constraints, four camera modes
+  baked per frame, GPU-free `/stage/preview`.
 - **Streaming choreography:** velocity-smooth seams via ARDY's `autoregressive_step` (change the prompt mid-stream instead of stitching segments).
 - **Live viewer injection:** push directed motion straight into the running viser demo.
 - **Scene generation:** the larger goal — compose full visual scenes (camera, staging, multiple characters, background) around ARDY's demo, with the LLM as director.
