@@ -21,6 +21,7 @@ Motion is written as ARDY-native .npz under OUTPUT_DIR and the path is returned,
 so ARDY's own viewer (scripts/visualize.py) can load it.
 """
 import os
+import sys
 import threading
 import time
 import uuid
@@ -28,11 +29,18 @@ import uuid
 import numpy as np
 import torch
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from ardy.model.load_model import load_model, load_text_encoder
 from ardy.model.registry import resolve_model_name
 from ardy.postprocess import post_process_motion
+
+# Launched as `python director_service/service.py`, so the repo root is not on
+# sys.path by default -- put it there so the `director_service` package imports
+# resolve whether run as a script or imported.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from director_service.fbx_export import fbx_document  # noqa: E402
 
 OUTPUT_DIR = os.environ.get("DIRECTOR_OUTPUT_DIR", os.path.expanduser("~/ardy/outputs/director"))
 ENCODER_URL = os.environ.get("DIRECTOR_ENCODER_URL", "http://localhost:9550")
@@ -227,6 +235,31 @@ def choreograph(req: ChoreographReq):
                 "segments": len(req.steps), "npz": path, "sequence": labels}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+
+@app.get("/export/{tag}.fbx")
+def export_fbx(tag: str, scale: float = 1.0):
+    """Export a generated clip as an FBX skeletal animation for Unreal / Maya.
+
+    Streams an ASCII FBX 7.4 file (joint hierarchy + per-frame animation) built
+    straight from the clip's baked joints and rotations -- no model reload, no
+    GPU. `scale` multiplies lengths (ARDY is metric; pass 100 for Unreal cm).
+    Import into UE5 and retarget onto the Mannequin / a MetaHuman via the IK
+    Retargeter -- see the README "ARDY -> Unreal Engine" section.
+    """
+    # tag names a clip _save_npz wrote as OUTPUT_DIR/<tag>.npz; keep it a bare
+    # filename so a crafted tag can't escape OUTPUT_DIR.
+    if not tag or "/" in tag or "\\" in tag or os.path.basename(tag) != tag:
+        raise HTTPException(status_code=400, detail="invalid tag")
+    path = os.path.join(OUTPUT_DIR, f"{tag}.npz")
+    try:
+        text, _report = fbx_document(path, scale=scale)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"no such clip: {tag}")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    headers = {"Content-Disposition": f'attachment; filename="{tag}.fbx"'}
+    return Response(content=text, media_type="application/octet-stream", headers=headers)
 
 
 if __name__ == "__main__":

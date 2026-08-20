@@ -86,6 +86,35 @@ def ardy_choreograph(steps: list[dict], model: str = "core",
 
 
 @mcp.tool()
+def ardy_export_fbx(tag: str, out_path: str, scale: float = 1.0) -> str:
+    """Export a generated clip to an FBX for Unreal Engine / Maya / Blender.
+
+    Takes the `tag` of a clip already produced by ardy_generate/ardy_choreograph
+    and downloads an FBX skeletal animation (joint hierarchy + per-frame motion).
+    The core skeleton uses Mixamo-style bone names, so UE's IK Retargeter drives
+    the UE5 Mannequin or a MetaHuman with no custom bone mapping.
+
+    Args:
+        tag: The clip tag (basename of the .npz, without extension).
+        out_path: Local path to write the .fbx to.
+        scale: Length multiplier; ARDY is metric, pass 100 for Unreal cm (default 1.0).
+
+    Returns: JSON with the written path, or an error.
+    """
+    try:
+        r = requests.get(f"{DIRECTOR_URL}/export/{tag}.fbx",
+                         params={"scale": scale}, timeout=TIMEOUT)
+        if r.status_code != 200:
+            return json.dumps({"ok": False, "error": r.text, "status": r.status_code})
+        with open(out_path, "wb") as fh:
+            fh.write(r.content)
+        return json.dumps({"ok": True, "out": out_path, "bytes": len(r.content),
+                           "tag": tag, "scale": scale}, indent=2)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+@mcp.tool()
 def ardy_list_models() -> str:
     """List the ARDY motion models available (core avatar vs G1 robot)."""
     try:
