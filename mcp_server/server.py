@@ -16,7 +16,11 @@ import json
 import os
 
 import requests
-from mcp.server.fastmcp import FastMCP
+try:  # mcp >= 2.0.0 removed mcp.server.fastmcp; FastMCP was renamed
+    # MCPServer and moved to mcp.server.mcpserver. Same .tool()/.run() API.
+    from mcp.server.mcpserver import MCPServer as FastMCP
+except ImportError:  # mcp 1.x
+    from mcp.server.fastmcp import FastMCP
 
 DIRECTOR_URL = os.environ.get("DIRECTOR_URL", "http://192.168.0.136:9600").rstrip("/")
 TIMEOUT = float(os.environ.get("DIRECTOR_TIMEOUT", "180"))
