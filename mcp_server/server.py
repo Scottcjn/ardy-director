@@ -63,25 +63,35 @@ def ardy_generate(prompt: str, model: str = "core", duration: float = 4.0,
 
 @mcp.tool()
 def ardy_choreograph(steps: list[dict], model: str = "core",
-                     seed: int | None = None, cfg_weight: float = 4.0) -> str:
+                     seed: int | None = None, cfg_weight: float = 4.0,
+                     heading_deg: float = 0.0, mode: str = "stream") -> str:
     """Choreograph a sequence of prompts into one continuous motion clip.
 
-    Each step runs ARDY and the segments are chained so the character continues
-    from where the previous step ended. Use this to direct multi-beat action.
+    The clip is streamed through ARDY: each beat is generated on top of the
+    motion already in flight, so the character carries its momentum through a
+    prompt change instead of popping at the boundary. Use this to direct
+    multi-beat action.
 
     Args:
         steps: list of {"prompt": str, "duration": float} beats, in order,
                e.g. [{"prompt":"walk to the desk","duration":3},
                      {"prompt":"sit down","duration":2},
                      {"prompt":"wave","duration":2}].
+               Durations are rounded to the model's generation horizon; the
+               response reports the frames each beat actually got.
         model: "core" or "g1".
-        seed: Optional base seed (each step uses seed+i).
+        seed: Optional seed for the whole stream.
         cfg_weight: Text guidance strength.
+        heading_deg: Initial facing, degrees about +Y (0 = +Z).
+        mode: "stream" (default) or "stitch" (v0.1 glued clips, for comparison
+              only -- it pops at every beat change).
 
-    Returns: JSON with the stitched .npz path and the sequence of beats.
+    Returns: JSON with the .npz path, per-beat segments, and the measured root
+    velocity jump at each seam.
     """
     return json.dumps(_post("/choreograph", {
         "steps": steps, "model": model, "seed": seed, "cfg_weight": cfg_weight,
+        "heading_deg": heading_deg, "mode": mode,
     }), indent=2)
 
 
