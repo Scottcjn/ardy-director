@@ -1,0 +1,444 @@
+{
+  "schema_version": "1.0",
+  "model": "core",
+  "fps": 20,
+  "about": {
+    "purpose": "A starting palette of prompts for the ARDY core model, so the engine ships with something better than a blank box.",
+    "phrasing": "ARDY's text encoder was trained on Bones Rigplay captions, which are third-person declarative sentences ('A person is walking.'). Prompts here follow that form. Imperative fragments ('walk to the desk', 'wave hello') are off-distribution *phrasing* even when the motion itself is in-distribution, and are more likely to drift. See README.",
+    "provenance_values": {
+      "upstream_preset": "Shipped by the model authors in nv-tlabs/ardy scripts/interactive_demo/common.py PRESET_PROMPTS. Author-vetted phrasing.",
+      "upstream_doc": "Used as a worked example in nv-tlabs/ardy scripts/generate.py.",
+      "derived": "Written for this library against the documented training distribution. In-distribution by construction, but not author-vetted."
+    },
+    "verification": {
+      "status": "UNVERIFIED — no prompt in this file has been confirmed on ARDY hardware yet.",
+      "how": "Run scripts/validate_prompts.py on the ARDY host against a live Director service, then --write-back to fold the results into the 'verified' and 'observed' fields.",
+      "why_it_matters": "'verified': false means nobody has watched this prompt produce motion. Do not read the notes as observations; they are expectations."
+    }
+  },
+  "categories": {
+    "locomotion": "Ground travel: walk, run, side-step, direction and style variations.",
+    "turning": "Changing facing, in place or while moving.",
+    "ground_transitions": "Sit, stand, crouch, bow — vertical transitions of the whole body.",
+    "jumps": "Both feet leaving the ground.",
+    "gestures": "Upper-body actions performed while standing.",
+    "kicks_strikes": "Limb strikes; in-distribution but high-energy.",
+    "dance": "Performance motion, often looping.",
+    "idle": "Low-energy standing behaviour — useful as filler between beats.",
+    "out_of_distribution": "Documented failures. These are NOT recommended prompts; they are here so users know the model's edges and are not surprised."
+  },
+  "prompts": [
+    {
+      "id": "loco-walk",
+      "category": "locomotion",
+      "prompt": "A person is walking.",
+      "duration": 5.0,
+      "expect_displacement": true,
+      "provenance": "upstream_preset",
+      "verified": false,
+      "note": "The canonical baseline. Upstream ships it as the demo's default prompt; if this one misbehaves, suspect the setup, not the prompt."
+    },
+    {
+      "id": "loco-walk-backwards",
+      "category": "locomotion",
+      "prompt": "A person is walking backwards.",
+      "duration": 5.0,
+      "expect_displacement": true,
+      "provenance": "upstream_preset",
+      "verified": false,
+      "note": "Travels opposite the facing direction, so root displacement is negative along the heading axis."
+    },
+    {
+      "id": "loco-sidestep-right",
+      "category": "locomotion",
+      "prompt": "A person side steps to the right.",
+      "duration": 4.0,
+      "expect_displacement": true,
+      "provenance": "upstream_preset",
+      "verified": false,
+      "note": "Lateral travel with facing held. Useful for staging without changing which way the character looks."
+    },
+    {
+      "id": "loco-sidestep-left",
+      "category": "locomotion",
+      "prompt": "A person side steps to the left.",
+      "duration": 4.0,
+      "expect_displacement": true,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Mirror of the upstream right-side preset. Worth checking whether left/right asymmetry shows up in the dataset."
+    },
+    {
+      "id": "loco-run",
+      "category": "locomotion",
+      "prompt": "A person is running forward.",
+      "duration": 5.0,
+      "expect_displacement": true,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Higher root speed than walking; expect a flight phase, so foot-contact fraction should drop well below the walk baseline."
+    },
+    {
+      "id": "loco-walk-slow",
+      "category": "locomotion",
+      "prompt": "A person walks forward slowly.",
+      "duration": 6.0,
+      "expect_displacement": true,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Speed adverb test. If displacement matches the plain walk, the model is ignoring the adverb — worth knowing."
+    },
+    {
+      "id": "loco-walk-elegant",
+      "category": "locomotion",
+      "prompt": "A young lady walks forward elegantly.",
+      "duration": 6.0,
+      "expect_displacement": true,
+      "provenance": "upstream_preset",
+      "verified": false,
+      "note": "Shows the encoder responds to style and subject wording, not just the verb."
+    },
+    {
+      "id": "loco-walk-circle",
+      "category": "locomotion",
+      "prompt": "A person walks in a circle.",
+      "duration": 8.0,
+      "expect_displacement": true,
+      "provenance": "upstream_doc",
+      "verified": false,
+      "note": "Upstream's own generate.py example. Needs a long duration to close the arc; at 4s you get a shallow curve instead."
+    },
+    {
+      "id": "turn-around-walk-back",
+      "category": "turning",
+      "prompt": "A person turns around and walks back.",
+      "duration": 6.0,
+      "expect_displacement": true,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Two beats in one prompt. Compare against splitting it across /choreograph steps — this is the cheapest test of which approach reads better."
+    },
+    {
+      "id": "turn-left-while-walking",
+      "category": "turning",
+      "prompt": "A person turns to the left while walking.",
+      "duration": 5.0,
+      "expect_displacement": true,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Curved path rather than a pivot. Ends on a different heading, which matters when chaining steps."
+    },
+    {
+      "id": "turn-sharp-right",
+      "category": "turning",
+      "prompt": "A person makes a sharp right turn.",
+      "duration": 4.0,
+      "expect_displacement": true,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Tests whether 'sharp' tightens the arc versus the gradual turn above."
+    },
+    {
+      "id": "turn-pivot-in-place",
+      "category": "turning",
+      "prompt": "A person pivots in place to face the opposite direction.",
+      "duration": 3.0,
+      "expect_displacement": false,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Heading changes ~180 degrees with little root travel. The one to use when staging a character who must face the other way without moving."
+    },
+    {
+      "id": "ground-stand",
+      "category": "ground_transitions",
+      "prompt": "A person is standing.",
+      "duration": 3.0,
+      "expect_displacement": false,
+      "provenance": "upstream_preset",
+      "verified": false,
+      "note": "The rest pose. Handy as a neutral opening or closing beat in a choreography."
+    },
+    {
+      "id": "ground-sit-down",
+      "category": "ground_transitions",
+      "prompt": "A person sits down.",
+      "duration": 4.0,
+      "expect_displacement": false,
+      "provenance": "derived",
+      "verified": false,
+      "note": "No chair exists in the scene — the model only knows the body motion, so the character sits on nothing. Stage a prop yourself if you need one."
+    },
+    {
+      "id": "ground-stand-up",
+      "category": "ground_transitions",
+      "prompt": "A person stands up from sitting.",
+      "duration": 4.0,
+      "expect_displacement": false,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Starts from a seated pose the model has to assume on its own; the first frames may snap. Chaining it after 'sits down' should read better than running it cold."
+    },
+    {
+      "id": "ground-bow",
+      "category": "ground_transitions",
+      "prompt": "A person bows down and then stands upright.",
+      "duration": 4.0,
+      "expect_displacement": false,
+      "provenance": "upstream_preset",
+      "verified": false,
+      "note": "A complete two-beat arc in one prompt — evidence the model handles 'X then Y' within a single clip."
+    },
+    {
+      "id": "ground-crouch",
+      "category": "ground_transitions",
+      "prompt": "A person crouches down low.",
+      "duration": 3.0,
+      "expect_displacement": false,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Root height drops without a full sit."
+    },
+    {
+      "id": "jump-backwards",
+      "category": "jumps",
+      "prompt": "A person jumps backwards.",
+      "duration": 3.0,
+      "expect_displacement": true,
+      "provenance": "upstream_preset",
+      "verified": false,
+      "note": "Short and punchy; padding the duration past the jump leaves the character idling afterwards."
+    },
+    {
+      "id": "jump-plain",
+      "category": "jumps",
+      "prompt": "A person jumps.",
+      "duration": 2.5,
+      "expect_displacement": false,
+      "provenance": "upstream_doc",
+      "verified": false,
+      "note": "Upstream's generate.py example. Vertical hop in place, so little XZ travel."
+    },
+    {
+      "id": "jump-forward",
+      "category": "jumps",
+      "prompt": "A person jumps forward.",
+      "duration": 3.0,
+      "expect_displacement": true,
+      "provenance": "derived",
+      "verified": false,
+      "note": "A broad jump; direction comes from the prompt, distance is the model's choice."
+    },
+    {
+      "id": "jump-hop-one-leg",
+      "category": "jumps",
+      "prompt": "A person hops on one leg.",
+      "duration": 4.0,
+      "expect_displacement": true,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Asymmetric contact. A good stress test of the foot-contact post-processing."
+    },
+    {
+      "id": "gesture-wave-right",
+      "category": "gestures",
+      "prompt": "A person waves with their right hand.",
+      "duration": 3.0,
+      "expect_displacement": false,
+      "provenance": "derived",
+      "verified": false,
+      "note": "The default 'greeting' beat. Note the phrasing: the README's 'wave hello' is the same motion in off-distribution wording."
+    },
+    {
+      "id": "gesture-raise-arms",
+      "category": "gestures",
+      "prompt": "A person raises both arms above their head.",
+      "duration": 3.0,
+      "expect_displacement": false,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Symmetric upper-body reach with the lower body still."
+    },
+    {
+      "id": "gesture-clap",
+      "category": "gestures",
+      "prompt": "A person claps their hands.",
+      "duration": 3.0,
+      "expect_displacement": false,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Small-amplitude and repetitive. Fine detail like finger contact is beyond a 27-joint skeleton, so judge the arms, not the hands."
+    },
+    {
+      "id": "gesture-point-forward",
+      "category": "gestures",
+      "prompt": "A person points forward with their right arm.",
+      "duration": 3.0,
+      "expect_displacement": false,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Directional gesture; the arm should track the facing, which makes it a decent check that heading is applied."
+    },
+    {
+      "id": "gesture-cross-arms",
+      "category": "gestures",
+      "prompt": "A person crosses their arms.",
+      "duration": 3.0,
+      "expect_displacement": false,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Static end pose rather than a cycle — the motion is the transition into it."
+    },
+    {
+      "id": "kick-right",
+      "category": "kicks_strikes",
+      "prompt": "A person is kicking with their right leg.",
+      "duration": 3.0,
+      "expect_displacement": false,
+      "provenance": "upstream_preset",
+      "verified": false,
+      "note": "Author-vetted. Balance is held on the support leg throughout."
+    },
+    {
+      "id": "kick-left",
+      "category": "kicks_strikes",
+      "prompt": "A person kicks with their left leg.",
+      "duration": 3.0,
+      "expect_displacement": false,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Mirror of the upstream preset — pair them to probe left/right bias in the dataset."
+    },
+    {
+      "id": "strike-punch-right",
+      "category": "kicks_strikes",
+      "prompt": "A person throws a punch with their right arm.",
+      "duration": 2.5,
+      "expect_displacement": false,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Fast upper-body strike; short duration keeps it from looping into shadow-boxing."
+    },
+    {
+      "id": "dance-ballet-turn",
+      "category": "dance",
+      "prompt": "A ballet dancer, performs a forward, turn joining feet, in a repeating loop",
+      "duration": 8.0,
+      "expect_displacement": true,
+      "provenance": "upstream_preset",
+      "verified": false,
+      "note": "Verbatim from upstream, comma splices and all — the phrasing is odd but author-vetted, so do not 'fix' it without re-checking. 'Repeating loop' wants a long duration."
+    },
+    {
+      "id": "dance-happy",
+      "category": "dance",
+      "prompt": "A person dances happily in place.",
+      "duration": 6.0,
+      "expect_displacement": false,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Open-ended: 'dance' spans a lot of the dataset, so expect variety across seeds. Pin the seed if you need it reproducible."
+    },
+    {
+      "id": "dance-spin",
+      "category": "dance",
+      "prompt": "A person spins around gracefully.",
+      "duration": 4.0,
+      "expect_displacement": false,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Continuous heading change in place. Chaining after this is where carried heading matters most."
+    },
+    {
+      "id": "perform-high-bow",
+      "category": "dance",
+      "prompt": "a performer gives high bow, with arms to the side, right leg crossed behind the left",
+      "duration": 5.0,
+      "expect_displacement": false,
+      "provenance": "upstream_preset",
+      "verified": false,
+      "note": "The most specific prompt upstream ships — limb-by-limb detail. The upper bound on how much articulation the encoder actually honours."
+    },
+    {
+      "id": "idle-look-around",
+      "category": "idle",
+      "prompt": "A person stands still and looks around.",
+      "duration": 5.0,
+      "expect_displacement": false,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Filler between beats so a character is not frozen. The 27-joint core skeleton has limited head articulation, so this reads mostly as torso."
+    },
+    {
+      "id": "idle-weight-shift",
+      "category": "idle",
+      "prompt": "A person shifts their weight from foot to foot while standing.",
+      "duration": 5.0,
+      "expect_displacement": false,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Subtle idle with alternating foot contacts, and much less dead than plain 'standing'."
+    },
+    {
+      "id": "idle-stretch",
+      "category": "idle",
+      "prompt": "A person stretches their arms while standing.",
+      "duration": 4.0,
+      "expect_displacement": false,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Slow upper-body idle."
+    },
+    {
+      "id": "ood-fly",
+      "category": "out_of_distribution",
+      "prompt": "A person flies like superman.",
+      "duration": 4.0,
+      "expect_displacement": true,
+      "expect_failure": true,
+      "provenance": "derived",
+      "verified": false,
+      "note": "The documented collapse case: no flight in a ground-motion dataset, so it lands on the nearest learned motion — a skip or a leap. Named in this repo's README; included so the failure is demonstrable rather than folklore."
+    },
+    {
+      "id": "ood-swim",
+      "category": "out_of_distribution",
+      "prompt": "A person swims across a pool.",
+      "duration": 5.0,
+      "expect_displacement": true,
+      "expect_failure": true,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Prone motion with no ground contact. Bones Rigplay is ground motion, so expect an upright walk with arm flailing."
+    },
+    {
+      "id": "ood-climb-ladder",
+      "category": "out_of_distribution",
+      "prompt": "A person climbs a ladder.",
+      "duration": 5.0,
+      "expect_failure": true,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Needs vertical translation and a prop to grip. Expect stepping in place with raised arms."
+    },
+    {
+      "id": "ood-ride-bicycle",
+      "category": "out_of_distribution",
+      "prompt": "A person rides a bicycle.",
+      "duration": 5.0,
+      "expect_failure": true,
+      "provenance": "derived",
+      "verified": false,
+      "note": "Prop-dependent, and the seated-pedalling pose has no ground-contact analogue."
+    },
+    {
+      "id": "ood-two-people",
+      "category": "out_of_distribution",
+      "prompt": "Two people shake hands with each other.",
+      "duration": 4.0,
+      "expect_failure": true,
+      "provenance": "derived",
+      "verified": false,
+      "note": "A structural limit rather than a data gap: one model call generates one character. The second person cannot appear at any duration or seed."
+    }
+  ]
+}

@@ -81,6 +81,56 @@ N64-Sophia flat-color rig).
 | `ardy_list_models` | List motion models (core vs G1). |
 | `ardy_status` | Service health: device, loaded models, encoder link. |
 
+## Prompt library
+
+`examples/prompts.json` is a starting palette so the engine ships with something
+better than a blank box — 36 usable prompts plus 5 documented failures.
+
+| Category | Prompts | What it covers |
+|----------|:-------:|----------------|
+| `locomotion` | 8 | Walk, run, side-step; direction and style variations. |
+| `turning` | 4 | Changing facing, in place or while moving. |
+| `ground_transitions` | 5 | Sit, stand, crouch, bow. |
+| `jumps` | 4 | Both feet leaving the ground. |
+| `gestures` | 5 | Upper-body actions performed while standing. |
+| `kicks_strikes` | 3 | Limb strikes; in-distribution but high-energy. |
+| `dance` | 4 | Performance motion, often looping. |
+| `idle` | 3 | Low-energy standing — filler between beats. |
+| `out_of_distribution` | 5 | **Known failures.** Not recommendations — the model's edges, documented so they don't surprise you. |
+
+Each entry carries a suggested `duration`, a one-line `note`, and a `provenance`:
+`upstream_preset` (verbatim from ARDY's own demo presets — author-vetted phrasing,
+don't "tidy" them), `upstream_doc` (an upstream worked example), or `derived`
+(written here against the documented training distribution).
+
+**Phrasing matters.** ARDY's text encoder was trained on Bones Rigplay captions,
+which are third-person declarative sentences — `"A person is walking."` The
+imperative fragments used elsewhere in this README (`"walk to the desk"`) are
+off-distribution *phrasing* even when the motion itself is in-distribution, and
+are likelier to drift. The library follows the caption form throughout.
+
+### Verifying the library
+
+⚠️ **The library ships unverified** — every prompt is written against ARDY's
+documented distribution, but none has been confirmed on hardware. `"verified":
+false` means nobody has watched it produce motion; read the notes as
+expectations, not observations.
+
+Confirming them is one command on a host that can reach the Director service:
+
+```bash
+python scripts/validate_prompts.py --url http://192.168.0.136:9600 --seed 42
+python scripts/validate_prompts.py --category locomotion --diffusion-steps 8  # quick sweep
+python scripts/validate_prompts.py --write-back    # fold results into prompts.json
+```
+
+It generates every prompt and reports mechanical signals — did it generate, how
+far the root travelled, how much of the clip had a foot down — flagging clips
+that contradict the library's own expectations (a locomotion prompt that never
+moves; an out-of-distribution prompt that sailed through). Those flags say where
+to point your eyes first. **They are not a verdict:** whether the motion matches
+the prompt needs a human. `--write-back` records what was observed per prompt.
+
 ## Roadmap
 
 - **v0.1 (now):** generate + position-chained choreography, model caching, encoder reuse.
