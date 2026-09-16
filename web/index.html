@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- Copyright (C) 2026 Elyan Labs LLC -->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ARDY Director — prompting engine</title>
+<style>
+  :root { --bg:#0e1116; --panel:#161b22; --edge:#2b333d; --ink:#e6edf3; --mut:#8b949e; --accent:#3fb950; --accent2:#388bfd; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+              font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  #app { display:grid; grid-template-columns:340px 1fr; height:100%; }
+  #side { background:var(--panel); border-right:1px solid var(--edge); padding:16px;
+          overflow-y:auto; display:flex; flex-direction:column; gap:14px; }
+  h1 { font-size:16px; margin:0 0 2px; }
+  h1 small { color:var(--mut); font-weight:400; font-size:12px; }
+  .field { display:flex; flex-direction:column; gap:4px; }
+  label { color:var(--mut); font-size:12px; }
+  input,textarea,select,button { font:inherit; color:var(--ink); background:#0d1117;
+          border:1px solid var(--edge); border-radius:6px; padding:7px 9px; }
+  textarea { resize:vertical; min-height:52px; }
+  .row { display:flex; gap:8px; }
+  .row > * { flex:1; min-width:0; }
+  button { cursor:pointer; background:#21262d; }
+  button:hover { border-color:var(--mut); }
+  button.primary { background:var(--accent); color:#04170a; border-color:var(--accent); font-weight:600; }
+  button.primary:disabled { opacity:.5; cursor:default; }
+  .tabs { display:flex; gap:6px; }
+  .tabs button { flex:1; }
+  .tabs button.on { background:var(--accent2); border-color:var(--accent2); color:#02121f; }
+  .beat { display:flex; gap:6px; align-items:center; background:#0d1117;
+          border:1px solid var(--edge); border-radius:6px; padding:6px; }
+  .beat textarea { flex:1; min-height:34px; }
+  .beat .dur { width:58px; flex:none; }
+  .beat .mini { width:26px; flex:none; padding:4px; text-align:center; }
+  #status { color:var(--mut); font-size:12px; min-height:16px; white-space:pre-wrap; }
+  #status.err { color:#f85149; }
+  #stage { position:relative; }
+  #transport { position:absolute; left:0; right:0; bottom:0; padding:10px 14px;
+               background:linear-gradient(transparent,rgba(0,0,0,.65)); display:flex;
+               gap:12px; align-items:center; }
+  #scrub { flex:1; accent-color:var(--accent); }
+  #tinfo { color:var(--mut); font-size:12px; min-width:120px; text-align:right; }
+  .hint { color:var(--mut); font-size:11px; }
+  #playpause { width:44px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="side">
+    <div><h1>ARDY Director <small>prompting engine</small></h1></div>
+
+    <div class="tabs">
+      <button id="tab-single" class="on">Single prompt</button>
+      <button id="tab-choreo">Choreograph</button>
+    </div>
+
+    <!-- single-prompt panel -->
+    <div id="panel-single" class="field">
+      <label for="prompt">Prompt</label>
+      <textarea id="prompt" placeholder="a person walks forward then waves">a person walks forward and waves</textarea>
+    </div>
+
+    <!-- choreograph panel: ordered list of beats -->
+    <div id="panel-choreo" style="display:none; gap:8px; flex-direction:column;" class="field">
+      <label>Beats (prompt + seconds) — run as one continuous clip</label>
+      <div id="beats"></div>
+      <button id="add-beat">+ add beat</button>
+    </div>
+
+    <div class="row">
+      <div class="field"><label for="duration">Duration (s)</label>
+        <input id="duration" type="number" min="0.5" max="30" step="0.5" value="4" /></div>
+      <div class="field"><label for="seed">Seed (blank=random)</label>
+        <input id="seed" type="number" placeholder="—" /></div>
+    </div>
+    <div class="row">
+      <div class="field"><label for="model">Model</label>
+        <select id="model"><option value="core">core (27-joint avatar)</option>
+          <option value="soma">soma (77-joint)</option>
+          <option value="g1">g1 (robot — not rendered here)</option></select></div>
+      <div class="field"><label for="heading">Facing (deg)</label>
+        <input id="heading" type="number" step="15" value="0" /></div>
+    </div>
+
+    <button id="go" class="primary">Generate ▶</button>
+    <div id="status"></div>
+    <div class="hint">Serve this from the Director host (<code>/ui/</code>). It calls the
+      same host's <code>/generate</code>, <code>/choreograph</code> and
+      <code>/motion/{tag}</code>. Override with <code>?api=http://host:9600</code>.</div>
+  </aside>
+
+  <main id="stage">
+    <div id="viewport"></div>
+    <div id="transport">
+      <button id="playpause" disabled>▶</button>
+      <input id="scrub" type="range" min="0" max="0" value="0" disabled />
+      <div id="tinfo">no clip</div>
+    </div>
+  </main>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+}}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// --- API base: same origin by default, ?api= override for cross-origin dev ---
+const API = new URLSearchParams(location.search).get('api') || '';
+const $ = (id) => document.getElementById(id);
+const statusEl = $('status');
+function say(msg, isErr=false){ statusEl.textContent = msg; statusEl.classList.toggle('err', isErr); }
+
+// ------------------------------------------------------------------ 3D scene
+const stage = $('viewport');
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+stage.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0e1116);
+const camera = new THREE.PerspectiveCamera(50, 1, 0.01, 100);
+camera.position.set(2.4, 1.6, 3.2);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.9, 0);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x223044, 1.1));
+const key = new THREE.DirectionalLight(0xffffff, 1.2); key.position.set(3, 6, 4); scene.add(key);
+const grid = new THREE.GridHelper(10, 20, 0x30363d, 0x21262d); scene.add(grid);
+
+function resize(){
+  const w = stage.clientWidth, h = stage.clientHeight;
+  renderer.setSize(w, h, false); camera.aspect = w/h || 1; camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(stage); resize();
+
+// Reusable skeleton primitives, rebuilt when joint count / topology changes.
+let jointGroup = null, boneSegments = null, clip = null;
+const jointMat = new THREE.MeshStandardMaterial({ color:0x3fb950, roughness:0.5 });
+const boneMat  = new THREE.LineBasicMaterial({ color:0x8b949e });
+
+function buildSkeleton(nJoints, parents){
+  if (jointGroup) scene.remove(jointGroup);
+  if (boneSegments) scene.remove(boneSegments);
+  jointGroup = new THREE.Group();
+  const sphere = new THREE.SphereGeometry(0.03, 10, 10);
+  for (let i=0;i<nJoints;i++){ const m = new THREE.Mesh(sphere, jointMat); jointGroup.add(m); }
+  scene.add(jointGroup);
+  // one line segment per non-root joint (child -> parent)
+  const edges = parents.map((p,i)=>[i,p]).filter(([,p]) => p>=0);
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(edges.length*6), 3));
+  boneSegments = new THREE.LineSegments(geo, boneMat);
+  boneSegments.userData.edges = edges;
+  scene.add(boneSegments);
+}
+
+// Show one frame: place joints, redraw bones. ARDY world coords are Y-up.
+function showFrame(fi){
+  if (!clip) return;
+  const f = clip.positions[Math.max(0, Math.min(fi, clip.positions.length-1))];
+  for (let i=0;i<f.length;i++){ const p = f[i]; jointGroup.children[i].position.set(p[0], p[1], p[2]); }
+  const attr = boneSegments.geometry.getAttribute('position');
+  boneSegments.userData.edges.forEach(([c,p], k) => {
+    const a = f[c], b = f[p];
+    attr.setXYZ(k*2,   a[0],a[1],a[2]);
+    attr.setXYZ(k*2+1, b[0],b[1],b[2]);
+  });
+  attr.needsUpdate = true;
+}
+
+// ---------------------------------------------------------------- playback
+let playing = false, frame = 0, lastT = 0, effFps = 30;
+const scrub = $('scrub'), tinfo = $('tinfo'), playBtn = $('playpause');
+
+function setFrame(fi){ frame = fi; scrub.value = fi; showFrame(fi);
+  if (clip) tinfo.textContent = `frame ${fi+1}/${clip.positions.length}  ·  ${clip.fps} fps`; }
+function play(){ if(!clip) return; playing = true; playBtn.textContent = '⏸'; lastT = performance.now(); }
+function pause(){ playing = false; playBtn.textContent = '▶'; }
+playBtn.onclick = () => playing ? pause() : play();
+scrub.oninput = () => { pause(); setFrame(+scrub.value); };
+
+function loop(now){
+  requestAnimationFrame(loop);
+  if (playing && clip){
+    const adv = (now - lastT) / 1000 * effFps;
+    if (adv >= 1){ let f = (frame + Math.floor(adv)) % clip.positions.length; lastT = now; setFrame(f); }
+  }
+  controls.update();
+  renderer.render(scene, camera);
+}
+requestAnimationFrame(loop);
+
+function loadClip(payload){
+  clip = payload;
+  effFps = payload.fps / payload.stride;                 // sampled array plays at real time
+  buildSkeleton(payload.joint_names.length, payload.parents);
+  scrub.max = payload.positions.length - 1; scrub.disabled = false; playBtn.disabled = false;
+  // mark seam frames (prompt changes) on the scrubber as a title hint
+  const seams = (payload.seam_frames||[]).map(s => Math.round(s/payload.stride));
+  scrub.title = seams.length ? `seams at frames: ${seams.join(', ')}` : '';
+  setFrame(0); play();
+  const j = payload.joint_names.length;
+  say(`clip ready · ${payload.frames} frames · ${j} joints${seams.length?` · ${seams.length} seam(s)`:''}`);
+}
+
+// ------------------------------------------------------------- API helpers
+async function postJSON(path, body){
+  const r = await fetch(API + path, { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body) });
+  const data = await r.json().catch(()=>({}));
+  if (!r.ok) throw new Error(data.detail || `${path} → ${r.status}`);
+  return data;
+}
+async function fetchMotion(tag){
+  const r = await fetch(`${API}/motion/${encodeURIComponent(tag)}`);
+  const data = await r.json().catch(()=>({}));
+  if (!r.ok) throw new Error(data.detail || `motion → ${r.status}`);
+  return data;
+}
+function seedVal(){ const v = $('seed').value.trim(); return v==='' ? null : Number(v); }
+
+// --------------------------------------------------------------- run buttons
+$('go').onclick = async () => {
+  const btn = $('go'); btn.disabled = true; pause();
+  try {
+    let out;
+    if (mode === 'single'){
+      const prompt = $('prompt').value.trim();
+      if (!prompt) throw new Error('enter a prompt');
+      say('generating…');
+      out = await postJSON('/generate', { prompt, model:$('model').value,
+        duration:Number($('duration').value), seed:seedVal(),
+        heading_deg:Number($('heading').value) });
+    } else {
+      const steps = readBeats();
+      if (!steps.length) throw new Error('add at least one beat');
+      say(`choreographing ${steps.length} beat(s)…`);
+      out = await postJSON('/choreograph', { steps, model:$('model').value,
+        seed:seedVal(), heading_deg:Number($('heading').value) });
+    }
+    say('rendering clip…');
+    loadClip(await fetchMotion(out.tag));
+  } catch (e){ say(String(e.message||e), true); }
+  finally { btn.disabled = false; }
+};
+
+// ------------------------------------------------------------- mode + beats
+let mode = 'single';
+function setMode(m){
+  mode = m;
+  $('tab-single').classList.toggle('on', m==='single');
+  $('tab-choreo').classList.toggle('on', m==='choreo');
+  $('panel-single').style.display = m==='single' ? 'flex' : 'none';
+  $('panel-choreo').style.display = m==='choreo' ? 'flex' : 'none';
+  $('duration').closest('.row').style.display = m==='single' ? 'flex' : 'none';
+  $('go').textContent = m==='single' ? 'Generate ▶' : 'Choreograph ▶';
+}
+$('tab-single').onclick = () => setMode('single');
+$('tab-choreo').onclick = () => setMode('choreo');
+
+const beatsEl = $('beats');
+function makeBeat(prompt='', dur=3){
+  const row = document.createElement('div'); row.className = 'beat';
+  row.innerHTML = `<textarea placeholder="beat prompt">${prompt}</textarea>
+    <input class="dur" type="number" min="0.5" step="0.5" value="${dur}" title="seconds" />
+    <button class="mini up" title="move up">↑</button>
+    <button class="mini down" title="move down">↓</button>
+    <button class="mini del" title="remove">✕</button>`;
+  row.querySelector('.up').onclick = () => { const p = row.previousElementSibling; if (p) beatsEl.insertBefore(row, p); };
+  row.querySelector('.down').onclick = () => { const n = row.nextElementSibling; if (n) beatsEl.insertBefore(n, row); };
+  row.querySelector('.del').onclick = () => row.remove();
+  beatsEl.appendChild(row);
+}
+function readBeats(){
+  return [...beatsEl.querySelectorAll('.beat')].map(r => ({
+    prompt: r.querySelector('textarea').value.trim(),
+    duration: Number(r.querySelector('.dur').value) })).filter(b => b.prompt);
+}
+$('add-beat').onclick = () => makeBeat('', 3);
+makeBeat('a person walks forward', 3);
+makeBeat('then stops and waves', 2);
+
+say('ready — enter a prompt and hit Generate');
+</script>
+</body>
+</html>

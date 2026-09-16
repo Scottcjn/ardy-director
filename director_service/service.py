@@ -16,9 +16,12 @@ Endpoints:
   GET  /models                      -> known model nicknames
   POST /generate    {prompt,...}    -> one clip from one prompt
   POST /choreograph {steps:[...]}   -> one clip stitched from a prompt sequence
+  GET  /motion/{tag}                -> a generated clip as JSON for the web viewport
+  GET  /ui/                         -> single-page prompting UI (static)
 
 Motion is written as ARDY-native .npz under OUTPUT_DIR and the path is returned,
-so ARDY's own viewer (scripts/visualize.py) can load it.
+so ARDY's own viewer (scripts/visualize.py) can load it. The same .npz is
+replayed in the browser by /ui via /motion/{tag}.
 """
 import os
 import threading
@@ -28,11 +31,15 @@ import uuid
 import numpy as np
 import torch
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from ardy.model.load_model import load_model, load_text_encoder
 from ardy.model.registry import resolve_model_name
 from ardy.postprocess import post_process_motion
+
+from director_service.web import WEB_DIR, motion_payload, npz_path_for
 
 OUTPUT_DIR = os.environ.get("DIRECTOR_OUTPUT_DIR", os.path.expanduser("~/ardy/outputs/director"))
 ENCODER_URL = os.environ.get("DIRECTOR_ENCODER_URL", "http://localhost:9550")
@@ -106,9 +113,34 @@ def _generate_clip(model, resolved_name, prompt, num_frames, diffusion_steps,
     return result
 
 
-def _save_npz(motion, fps, text, tag):
+def _skeleton_topology(model):
+    """(joint_names, parent_index_per_joint) for the model's skeleton.
+
+    Pulled straight off the loaded skeleton so it stays correct for whatever
+    avatar skeleton the model uses (core=27, soma=77, ...). Stored in the npz
+    at save time so /motion can serve the clip without reloading the model.
+    Returns (None, None) if the model exposes no drawable skeleton (e.g. g1 robot
+    qpos), in which case the clip is still saved, just not web-renderable.
+    """
+    skel = getattr(model, "skeleton", None)
+    names = getattr(skel, "bone_order_names", None)
+    parents = getattr(skel, "joint_parents", None)
+    if names is None or parents is None:
+        return None, None
+    parents = parents.detach().cpu().numpy() if torch.is_tensor(parents) else np.asarray(parents)
+    return list(names), parents.astype(np.int64)
+
+
+def _save_npz(motion, fps, text, tag, joint_names=None, joint_parents=None, seam_frames=None):
     path = os.path.join(OUTPUT_DIR, f"{tag}.npz")
-    np.savez(path, fps=np.int64(fps), text=np.array(text), **motion)
+    extra = {}
+    if joint_names is not None:
+        extra["joint_names"] = np.array([str(n) for n in joint_names])
+    if joint_parents is not None:
+        extra["joint_parents"] = np.asarray(joint_parents, dtype=np.int64)
+    if seam_frames is not None:
+        extra["seam_frames"] = np.asarray(seam_frames, dtype=np.int64)
+    np.savez(path, fps=np.int64(fps), text=np.array(text), **extra, **motion)
     return path
 
 
@@ -166,10 +198,11 @@ def generate(req: GenerateReq):
         hist = (int(round(10 * fps)) // patch) * patch  # trained ~10s window
         motion = _generate_clip(model, resolved, req.prompt, num_frames, steps,
                                 req.cfg_weight, req.seed, np.deg2rad(req.heading_deg), hist)
+        names, parents = _skeleton_topology(model)
         tag = f"gen_{int(time.time())}_{uuid.uuid4().hex[:6]}"
-        path = _save_npz(motion, fps, req.prompt, tag)
+        path = _save_npz(motion, fps, req.prompt, tag, joint_names=names, joint_parents=parents)
         return {"ok": True, "model": resolved, "fps": int(fps), "frames": num_frames,
-                "duration_s": req.duration, "npz": path, "prompt": req.prompt}
+                "duration_s": req.duration, "npz": path, "tag": tag, "prompt": req.prompt}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
@@ -197,6 +230,7 @@ def choreograph(req: ChoreographReq):
         root_offset = np.zeros(3, dtype=np.float32)
         heading_rad = 0.0
         labels = []
+        seams, frame = [], 0  # frame index where each new step begins (for UI markers)
         for i, st in enumerate(req.steps):
             nf = int(st.duration * fps)
             seed_i = None if req.seed is None else req.seed + i
@@ -218,15 +252,50 @@ def choreograph(req: ChoreographReq):
                 if k in m:
                     acc[k].append(m[k])
             labels.append(st.prompt)
+            if i > 0:
+                seams.append(frame)
+            frame += int(rp.shape[0])
 
         motion = {k: np.concatenate(v, axis=0) for k, v in acc.items() if v}
+        names, parents = _skeleton_topology(model)
         tag = f"choreo_{int(time.time())}_{uuid.uuid4().hex[:6]}"
-        path = _save_npz(motion, fps, " | ".join(labels), tag)
+        path = _save_npz(motion, fps, " | ".join(labels), tag,
+                         joint_names=names, joint_parents=parents, seam_frames=seams)
         total = int(sum(int(s.duration * fps) for s in req.steps))
         return {"ok": True, "model": resolved, "fps": int(fps), "frames": total,
-                "segments": len(req.steps), "npz": path, "sequence": labels}
+                "segments": len(req.steps), "npz": path, "tag": tag,
+                "seam_frames": seams, "sequence": labels}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+
+@app.get("/motion/{tag}")
+def motion(tag: str, stride: int = 1):
+    """Replay a generated clip as JSON for the browser viewport.
+
+    `stride` thins the frames for the wire (the UI resamples time back to real
+    fps), useful for long clips over a slow link. Path traversal on `tag` is
+    rejected before the filesystem is touched.
+    """
+    path = npz_path_for(OUTPUT_DIR, tag)
+    if path is None:
+        raise HTTPException(status_code=400, detail="invalid tag")
+    try:
+        return motion_payload(path, stride=stride)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"no such clip: {tag}")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@app.get("/")
+def root():
+    return RedirectResponse(url="/ui/")
+
+
+# Single-page prompting UI. html=True serves index.html at /ui/.
+if os.path.isdir(WEB_DIR):
+    app.mount("/ui", StaticFiles(directory=WEB_DIR, html=True), name="ui")
 
 
 if __name__ == "__main__":
